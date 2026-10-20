@@ -1,108 +1,437 @@
 pipeline {
     agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '15',
+            artifactNumToKeepStr: '10'
+        ))
+    }
+
     tools {
-        jdk 'jdk17'
-        nodejs 'node23'
+        nodejs 'node'
     }
+
     environment {
-        SCANNER_HOME=tool 'sonar-scanner'
+        GIT_URL           = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH        = 'master'
+
+        SONAR_SERVER      = 'sonarqube'
+        SONAR_TOKEN       = 'sonar-token'
+        SONAR_PROJECT_KEY = 'zomato-kastro'
+
+        DOCKERHUB_USERNAME = 'teqvivek123'
+        IMAGE_NAME         = 'teqvivek123/zomato-kastro'
+
+        REPORT_DIR        = 'security-reports'
     }
+
     stages {
-        stage ("clean workspace") {
+
+        stage('Checkout') {
             steps {
-                cleanWs()
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+
+                sh '''
+                    set -eu
+
+                    echo "===== Repository Information ====="
+                    git log -1 --oneline
+
+                    echo "===== NodeJS Version ====="
+                    node --version
+
+                    echo "===== npm Version ====="
+                    npm --version
+
+                    echo "===== Docker Version ====="
+                    docker --version
+
+                    echo "===== Verify Project Files ====="
+                    test -f package.json || {
+                        echo "ERROR: package.json not found"
+                        exit 1
+                    }
+
+                    test -f Dockerfile || {
+                        echo "ERROR: Dockerfile not found in repository root"
+                        exit 1
+                    }
+
+                    echo "Project and Dockerfile verified."
+                '''
             }
         }
-        stage ("Git Checkout") {
+
+        stage('Initialize Reports') {
             steps {
-                git 'https://github.com/KastroVKiran/Zomato-Project-Kastro.git'
+                sh '''
+                    mkdir -p "$REPORT_DIR"
+
+                    cat > "$REPORT_DIR/README.txt" <<'EOF'
+Zomato Kastro - Jenkins Pipeline Reports
+
+gitleaks-report.json       Gitleaks secret scan results
+trivy-report.json          Trivy filesystem scan in JSON
+trivy-report.txt           Trivy filesystem scan in table format
+trivy-image-report.json    Trivy container image scan in JSON
+trivy-image-report.txt     Trivy container image scan in table format
+sonar-scanner.log          SonarScanner execution log
+
+Scanner findings do not fail the pipeline for Gitleaks or Trivy.
+Check the corresponding error files and Jenkins Console Output
+to distinguish scan findings from scanner execution failures.
+
+Docker image:
+teqvivek123/zomato-kastro
+EOF
+
+                    echo '{"error":"Gitleaks scan not completed"}' \
+                        > "$REPORT_DIR/gitleaks-report.json"
+
+                    echo '{"error":"Trivy filesystem scan not completed"}' \
+                        > "$REPORT_DIR/trivy-report.json"
+
+                    echo "Trivy filesystem scan not completed" \
+                        > "$REPORT_DIR/trivy-report.txt"
+
+                    echo '{"error":"Trivy image scan not completed"}' \
+                        > "$REPORT_DIR/trivy-image-report.json"
+
+                    echo "Trivy image scan not completed" \
+                        > "$REPORT_DIR/trivy-image-report.txt"
+                '''
             }
         }
-        stage("Sonarqube Analysis"){
-            steps{
-                withSonarQubeEnv('sonar-server') {
-                    sh ''' $SCANNER_HOME/bin/sonar-scanner -Dsonar.projectName=zomato \
-                    -Dsonar.projectKey=zomato '''
-                }
+
+        stage('Install Dependencies') {
+            steps {
+                sh '''
+                    set -eu
+
+                    if [ -f package-lock.json ]; then
+                        npm ci
+                    else
+                        echo "WARNING: package-lock.json not found; using npm install"
+                        npm install
+                    fi
+                '''
             }
         }
-        stage("Code Quality Gate"){
-           steps {
-                script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'Sonar-token' 
-                }
-            } 
-        }
-        stage("Install NPM Dependencies") {
+
+        stage('Build and Test') {
             steps {
-                sh "npm install"
+                sh '''
+                    set -eu
+
+                    echo "===== Application Build ====="
+                    npm run build --if-present
+
+                    echo "===== Application Tests ====="
+
+                    if node -e "
+                        const p = require('./package.json');
+                        process.exit(p.scripts && p.scripts.test ? 0 : 1);
+                    "; then
+                        CI=true npm test -- --watchAll=false --passWithNoTests
+                    else
+                        echo "No test script configured. Skipping tests."
+                    fi
+
+                    echo "===== Build and Test Completed ====="
+                '''
             }
         }
-        stage('OWASP FS SCAN') {
+
+        stage('SonarQube Analysis') {
             steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check'
-                dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
-    }
-}
-        stage ("Trivy File Scan") {
-            steps {
-                sh "trivy fs . > trivy.txt"
-            }
-        }
-        stage ("Build Docker Image") {
-            steps {
-                sh "docker build -t zomato ."
-            }
-        }
-        stage ("Tag & Push to DockerHub") {
-            steps {
-                script {
-                    withDockerRegistry(credentialsId: 'docker') {
-                        sh "docker tag zomato kastrov/zomato:latest "
-                        sh "docker push kastrov/zomato:latest "
+                withSonarQubeEnv("${SONAR_SERVER}") {
+                    withCredentials([
+                        string(
+                            credentialsId: "${SONAR_TOKEN}",
+                            variable: 'SONAR_AUTH_TOKEN'
+                        )
+                    ]) {
+                        sh '''
+                            set +e
+
+                            docker run --rm \
+                              -e SONAR_HOST_URL="$SONAR_HOST_URL" \
+                              -e SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
+                              -v "$WORKSPACE:/usr/src" \
+                              -w /usr/src \
+                              sonarsource/sonar-scanner-cli:latest \
+                              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
+                              -Dsonar.sources=src \
+                              -Dsonar.exclusions="node_modules/**,build/**,security-reports/**,coverage/**" \
+                              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                              > "$REPORT_DIR/sonar-scanner.log" 2>&1
+
+                            SCAN_RC=$?
+
+                            cat "$REPORT_DIR/sonar-scanner.log"
+
+                            if [ "$SCAN_RC" -ne 0 ]; then
+                                echo "SonarScanner execution failed with exit code $SCAN_RC"
+                                echo "$SCAN_RC" > "$REPORT_DIR/sonar-scan-error.txt"
+                                exit "$SCAN_RC"
+                            fi
+                        '''
                     }
                 }
             }
         }
-        stage('Docker Scout Image') {
+
+        stage('Gitleaks Secret Scan') {
             steps {
-                script{
-                   withDockerRegistry(credentialsId: 'docker', toolName: 'docker'){
-                       sh 'docker-scout quickview kastrov/zomato:latest'
-                       sh 'docker-scout cves kastrov/zomato:latest'
-                       sh 'docker-scout recommendations kastrov/zomato:latest'
-                   }
+                sh '''
+                    echo "===== Gitleaks Secret Scan ====="
+                    set +e
+
+                    docker run --rm \
+                      -v "$WORKSPACE:/path" \
+                      zricethezav/gitleaks:latest \
+                      detect \
+                      --source=/path \
+                      --no-git \
+                      --redact \
+                      --report-format=json \
+                      --report-path=/path/security-reports/gitleaks-report.json \
+                      --exit-code=0
+
+                    SCAN_RC=$?
+
+                    echo "Gitleaks execution exit code: $SCAN_RC"
+
+                    if [ "$SCAN_RC" -ne 0 ]; then
+                        echo "Gitleaks scan execution failed with exit code $SCAN_RC" \
+                          > "$REPORT_DIR/gitleaks-scan-error.txt"
+                    fi
+
+                    # Findings and scan errors do not fail this stage.
+                    exit 0
+                '''
+            }
+        }
+
+        stage('Trivy Filesystem Scan') {
+            steps {
+                sh '''
+                    echo "===== Trivy Filesystem JSON Scan ====="
+                    set +e
+
+                    docker run --rm \
+                      -v "$WORKSPACE:/path" \
+                      aquasec/trivy:latest \
+                      fs \
+                      --scanners vuln,misconfig,secret \
+                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                      --format json \
+                      --output /path/security-reports/trivy-report.json \
+                      --exit-code 0 \
+                      --skip-dirs /path/node_modules \
+                      --skip-dirs /path/.git \
+                      /path
+
+                    JSON_RC=$?
+
+                    echo "===== Trivy Filesystem Table Scan ====="
+
+                    docker run --rm \
+                      -v "$WORKSPACE:/path" \
+                      aquasec/trivy:latest \
+                      fs \
+                      --scanners vuln,misconfig,secret \
+                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                      --format table \
+                      --output /path/security-reports/trivy-report.txt \
+                      --exit-code 0 \
+                      --skip-dirs /path/node_modules \
+                      --skip-dirs /path/.git \
+                      /path
+
+                    TABLE_RC=$?
+
+                    echo "Trivy JSON execution exit code: $JSON_RC"
+                    echo "Trivy table execution exit code: $TABLE_RC"
+
+                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
+                        echo "One or more Trivy filesystem scans failed to execute." \
+                          > "$REPORT_DIR/trivy-scan-error.txt"
+                    fi
+
+                    # Findings and scan errors do not fail this stage.
+                    exit 0
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "===== Build Docker Image ====="
+
+                    docker build \
+                      --pull \
+                      -t "$IMAGE_NAME:$BUILD_NUMBER" \
+                      -t "$IMAGE_NAME:latest" \
+                      .
+
+                    echo "===== Image Build Successful ====="
+
+                    docker images "$IMAGE_NAME"
+                '''
+            }
+        }
+
+        stage('Trivy Docker Image Scan') {
+            steps {
+                sh '''
+                    echo "===== Trivy Docker Image JSON Scan ====="
+                    set +e
+
+                    docker run --rm \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      -v "$WORKSPACE/$REPORT_DIR:/reports" \
+                      aquasec/trivy:latest \
+                      image \
+                      --scanners vuln,misconfig,secret \
+                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                      --format json \
+                      --output /reports/trivy-image-report.json \
+                      --exit-code 0 \
+                      "$IMAGE_NAME:$BUILD_NUMBER"
+
+                    JSON_RC=$?
+
+                    echo "===== Trivy Docker Image Table Scan ====="
+
+                    docker run --rm \
+                      -v /var/run/docker.sock:/var/run/docker.sock \
+                      -v "$WORKSPACE/$REPORT_DIR:/reports" \
+                      aquasec/trivy:latest \
+                      image \
+                      --scanners vuln,misconfig,secret \
+                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                      --format table \
+                      --output /reports/trivy-image-report.txt \
+                      --exit-code 0 \
+                      "$IMAGE_NAME:$BUILD_NUMBER"
+
+                    TABLE_RC=$?
+
+                    echo "Trivy image JSON execution exit code: $JSON_RC"
+                    echo "Trivy image table execution exit code: $TABLE_RC"
+
+                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
+                        echo "One or more Trivy image scans failed to execute." \
+                          > "$REPORT_DIR/trivy-image-scan-error.txt"
+                    fi
+
+                    # Findings and scan errors do not fail this stage.
+                    exit 0
+                '''
+            }
+        }
+
+        stage('Push Docker Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-cred',
+                        usernameVariable: 'DOCKERHUB_USER',
+                        passwordVariable: 'DOCKERHUB_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        echo "===== Docker Hub Login ====="
+
+                        if [ "$DOCKERHUB_USER" != "$DOCKERHUB_USERNAME" ]; then
+                            echo "ERROR: Username in Jenkins credential docker-cred does not match $DOCKERHUB_USERNAME"
+                            exit 1
+                        fi
+
+                        trap 'docker logout >/dev/null 2>&1 || true' EXIT
+
+                        printf '%s' "$DOCKERHUB_PASSWORD" | \
+                          docker login \
+                            --username "$DOCKERHUB_USER" \
+                            --password-stdin
+
+                        echo "===== Push Build Number Tag ====="
+                        docker push "$IMAGE_NAME:$BUILD_NUMBER"
+
+                        echo "===== Push Latest Tag ====="
+                        docker push "$IMAGE_NAME:latest"
+
+                        echo "===== Docker Hub Push Completed ====="
+                        echo "Image: $IMAGE_NAME:$BUILD_NUMBER"
+                        echo "Image: $IMAGE_NAME:latest"
+                    '''
                 }
             }
         }
-        stage ("Deploy to Container") {
-            steps {
-                sh 'docker run -d --name zomato -p 3000:3000 kastrov/zomato:latest'
-            }
-        }
     }
+
     post {
-    always {
-        emailext attachLog: true,
-            subject: "'${currentBuild.result}'",
-            body: """
-                <html>
-                <body>
-                    <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
-                    </div>
-                    <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
-                    </div>
-                    <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
-                        <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
-                    </div>
-                </body>
-                </html>
-            """,
-            to: 'kastrokiran@gmail.com',
-            mimeType: 'text/html',
-            attachmentsPattern: 'trivy.txt'
+        always {
+            archiveArtifacts(
+                artifacts: 'security-reports/**/*',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            echo '''
+            ==========================================
+            PIPELINE FINISHED
+            ==========================================
+
+            Download reports from:
+            Jenkins Job -> Build Number -> Artifacts
+
+            Security reports:
+            - gitleaks-report.json
+            - trivy-report.json
+            - trivy-report.txt
+            - trivy-image-report.json
+            - trivy-image-report.txt
+            - sonar-scanner.log
+            - README.txt
+
+            Docker Hub:
+            https://hub.docker.com/r/teqvivek123/zomato-kastro
+
+            Image tags:
+            - Build number
+            - latest
+
+            Gitleaks and Trivy findings do not fail
+            the pipeline. Check scan error files and
+            Console Output for execution errors.
+            ==========================================
+            '''
+        }
+
+        success {
+            echo 'Pipeline completed successfully, including Docker image push.'
+        }
+
+        failure {
+            echo 'A build, test, SonarScanner or Docker build/push stage failed. Review Console Output and archived reports.'
+        }
+
+        cleanup {
+            echo 'Pipeline execution finished.'
         }
     }
 }
