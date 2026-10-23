@@ -1,0 +1,170 @@
+
+pipeline {
+    agent {
+        label 'jenkins_agent'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '5'))
+    }
+
+    environment {
+        GIT_URL          = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH       = 'master'
+        DT_URL           = 'http://15.206.75.174:8087'
+        DT_PROJECT_NAME  = 'DevOps-Project-Zomato-Kastro'
+        DT_PROJECT_VERSION = 'master'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                git branch: "${GIT_BRANCH}", url: "${GIT_URL}"
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Trivy Scan & Table Report') {
+            steps {
+                sh '''
+                    mkdir -p security-reports
+                    rm -f security-reports/trivy-report.json
+
+                    docker run --rm \
+                        -v "$WORKSPACE:/repo" \
+                        aquasec/trivy:latest fs /repo \
+                        --scanners vuln,misconfig,secret \
+                        --skip-dirs /repo/.git \
+                        --format json \
+                        --output /repo/security-reports/trivy-report.json \
+                        --exit-code 0
+
+                    python3 - <<'PY'
+import json
+
+with open("security-reports/trivy-report.json") as f:
+    report = json.load(f)
+
+rows = []
+
+for result in report.get("Results", []) or []:
+    target = result.get("Target", "-")
+
+    for v in result.get("Vulnerabilities", []) or []:
+        rows.append([
+            "Vulnerability", v.get("Severity", "-"), target,
+            v.get("VulnerabilityID", "-"), v.get("PkgName", "-"),
+            v.get("InstalledVersion", "-"), v.get("FixedVersion", "-")
+        ])
+
+    for v in result.get("Misconfigurations", []) or []:
+        rows.append([
+            "Misconfiguration", v.get("Severity", "-"), target,
+            v.get("ID", "-"), "-", "-", "-"
+        ])
+
+    for v in result.get("Secrets", []) or []:
+        rows.append([
+            "Secret", v.get("Severity", "-"), target,
+            v.get("RuleID", "-"), "-", "-", "-"
+        ])
+
+headers = ["TYPE", "SEVERITY", "TARGET", "ID / RULE",
+           "PACKAGE", "INSTALLED", "FIXED VERSION"]
+widths = [18, 10, 25, 24, 22, 18, 18]
+
+def fmt(value, width):
+    value = str(value if value is not None else "-").replace("\\n", " ")
+    return (value[:width-3] + "...").ljust(width) if len(value) > width else value.ljust(width)
+
+line = "+" + "+".join("-" * (w + 2) for w in widths) + "+"
+
+print("\\nTRIVY SECURITY FINDINGS")
+print(line)
+print("| " + " | ".join(fmt(h, w) for h, w in zip(headers, widths)) + " |")
+print(line)
+
+for row in rows:
+    print("| " + " | ".join(fmt(v, w) for v, w in zip(row, widths)) + " |")
+
+if not rows:
+    print("No findings reported by Trivy.")
+
+print(line)
+print("Total findings:", len(rows))
+PY
+                '''
+            }
+        }
+
+        stage('Generate SBOM') {
+            steps {
+                sh '''
+                    docker run --rm \
+                        -v "$WORKSPACE:/repo" \
+                        aquasec/trivy:latest fs /repo \
+                        --skip-dirs /repo/.git \
+                        --format cyclonedx \
+                        --output /repo/security-reports/sbom.cdx.json
+
+                    test -s security-reports/sbom.cdx.json
+                    echo "CycloneDX SBOM generated successfully."
+                '''
+            }
+        }
+
+        stage('Upload SBOM to Dependency-Track') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'DT-token-k8s',
+                        variable: 'DT_API_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set +x
+
+                        echo "Uploading SBOM to Dependency-Track..."
+
+                        curl --fail --silent --show-error \
+                            --request POST \
+                            --url "$DT_URL/api/v1/bom" \
+                            --header "X-Api-Key: $DT_API_KEY" \
+                            --form "autoCreate=true" \
+                            --form "projectName=$DT_PROJECT_NAME" \
+                            --form "projectVersion=$DT_PROJECT_VERSION" \
+                            --form "bom=@security-reports/sbom.cdx.json;type=application/json" \
+                            --output /tmp/dt-upload-response.json
+
+                        echo "SBOM accepted by Dependency-Track API."
+                        echo "Project: $DT_PROJECT_NAME"
+                        echo "Version: $DT_PROJECT_VERSION"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'security-reports/trivy-report.json,security-reports/sbom.cdx.json',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            echo 'Trivy JSON report and CycloneDX SBOM are available under Build > Artifacts.'
+        }
+
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Console Output for scan or upload errors.'
+        }
+    }
+}
