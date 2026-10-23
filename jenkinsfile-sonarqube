@@ -1,0 +1,85 @@
+
+pipeline {
+    agent {
+        label 'jenkins_agent'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+
+    environment {
+        GIT_URL       = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH    = 'master'
+        SONAR_PROJECT = 'zomato-kastro'
+        SONAR_URL     = 'http://15.206.75.174:9000'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+
+                sh '''
+                    echo "===== Checkout Successful ====="
+                    git log -1 --oneline
+                    ls -la
+                '''
+            }
+        }
+
+        stage('SonarQube Scan') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'sonar-token',
+                        variable: 'SONAR_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "===== Starting SonarQube Scan ====="
+
+                        docker run --rm \
+                            -v "$WORKSPACE:/usr/src" \
+                            -w /usr/src \
+                            -e SONAR_HOST_URL="$SONAR_URL" \
+                            -e SONAR_TOKEN="$SONAR_TOKEN" \
+                            sonarsource/sonar-scanner-cli:latest \
+                            -Dsonar.projectKey="$SONAR_PROJECT" \
+                            -Dsonar.projectName="Zomato Kastro" \
+                            -Dsonar.sources=src \
+                            -Dsonar.scm.provider=git \
+                            -Dsonar.exclusions="node_modules/**,**/node_modules/**,**/dist/**,**/build/**"
+
+                        echo "===== SonarQube Scan Completed ====="
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'Checkout and SonarQube analysis completed successfully.'
+            echo 'View the project at http://15.206.75.174:9000/'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Console Output for details.'
+        }
+
+        always {
+            echo 'Jenkins pipeline execution finished.'
+        }
+    }
+}
