@@ -42,6 +42,17 @@ apt install docker.io -y
 sudo usermod -aG docker jenkins
 sudo systemctl restart jenkins
 
+Dependency-tracker
+ docker pull owasp/dependency-track:latest                |
+                                                          |
+docker run -d \
+  -p 8087:8080 \
+  --name dependency-track \
+  -e "ADMIN_PASSWORD=Tracker@1" \
+  dependencytrack/bundled
+
+DT-analyser-https://guide.sonatype.com/settings/tokens
+
 sonarqube-
 docker run -d --name sonarqube -p 9000:9000 sonarqube:lts-community
 
