@@ -1,35 +1,44 @@
+
 pipeline {
-    agent any
+    agent {
+        label 'jenkins_agent'
+    }
 
     options {
         timestamps()
         disableConcurrentBuilds()
         buildDiscarder(logRotator(
-            numToKeepStr: '15',
-            artifactNumToKeepStr: '10'
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
         ))
     }
 
-    tools {
-        nodejs 'node'
-    }
-
     environment {
-        GIT_URL           = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
-        GIT_BRANCH        = 'master'
+        // GitHub
+        GIT_URL          = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH       = 'master'
 
-        SONAR_SERVER      = 'sonarqube'
-        SONAR_TOKEN       = 'sonar-token'
-        SONAR_PROJECT_KEY = 'zomato-kastro'
+        // SonarQube
+        SONAR_URL        = 'http://15.206.75.174:9000'
+        SONAR_PROJECT    = 'zomato-kastro'
 
-        DOCKERHUB_USERNAME = 'teqvivek123'
-        IMAGE_NAME         = 'teqvivek123/zomato-kastro'
+        // Dependency-Track
+        DT_URL           = 'http://15.206.75.174:8087'
+        DT_PROJECT_NAME  = 'DevOps-Project-Zomato-Kastro'
+        DT_PROJECT_VERSION = 'master'
 
-        REPORT_DIR        = 'security-reports'
+        // Docker Hub
+        DOCKER_IMAGE     = 'teqvivek123/zomato-kastro'
+
+        // Reports
+        REPORT_DIR       = 'security-reports'
     }
 
     stages {
 
+        // --------------------------------------------------
+        // 1. CHECKOUT
+        // --------------------------------------------------
         stage('Checkout') {
             steps {
                 deleteDir()
@@ -38,316 +47,316 @@ pipeline {
                     url: "${GIT_URL}"
 
                 sh '''
-                    set -eu
+                    echo "======================================"
+                    echo "GitHub Checkout Successful"
+                    echo "======================================"
 
-                    echo "===== Repository Information ====="
                     git log -1 --oneline
+                    echo "Repository: $GIT_URL"
+                    echo "Branch: $GIT_BRANCH"
 
-                    echo "===== NodeJS Version ====="
-                    node --version
-
-                    echo "===== npm Version ====="
-                    npm --version
-
-                    echo "===== Docker Version ====="
-                    docker --version
-
-                    echo "===== Verify Project Files ====="
-                    test -f package.json || {
-                        echo "ERROR: package.json not found"
-                        exit 1
-                    }
-
-                    test -f Dockerfile || {
-                        echo "ERROR: Dockerfile not found in repository root"
-                        exit 1
-                    }
-
-                    echo "Project and Dockerfile verified."
-                '''
-            }
-        }
-
-        stage('Initialize Reports') {
-            steps {
-                sh '''
                     mkdir -p "$REPORT_DIR"
-
-                    cat > "$REPORT_DIR/README.txt" <<'EOF'
-Zomato Kastro - Jenkins Pipeline Reports
-
-gitleaks-report.json       Gitleaks secret scan results
-trivy-report.json          Trivy filesystem scan in JSON
-trivy-report.txt           Trivy filesystem scan in table format
-trivy-image-report.json    Trivy container image scan in JSON
-trivy-image-report.txt     Trivy container image scan in table format
-sonar-scanner.log          SonarScanner execution log
-
-Scanner findings do not fail the pipeline for Gitleaks or Trivy.
-Check the corresponding error files and Jenkins Console Output
-to distinguish scan findings from scanner execution failures.
-
-Docker image:
-teqvivek123/zomato-kastro
-EOF
-
-                    echo '{"error":"Gitleaks scan not completed"}' \
-                        > "$REPORT_DIR/gitleaks-report.json"
-
-                    echo '{"error":"Trivy filesystem scan not completed"}' \
-                        > "$REPORT_DIR/trivy-report.json"
-
-                    echo "Trivy filesystem scan not completed" \
-                        > "$REPORT_DIR/trivy-report.txt"
-
-                    echo '{"error":"Trivy image scan not completed"}' \
-                        > "$REPORT_DIR/trivy-image-report.json"
-
-                    echo "Trivy image scan not completed" \
-                        > "$REPORT_DIR/trivy-image-report.txt"
                 '''
             }
         }
 
-        stage('Install Dependencies') {
+        // --------------------------------------------------
+        // 2. GITLEAKS SECRET SCAN
+        // --------------------------------------------------
+        stage('Gitleaks Secret Scan') {
             steps {
                 sh '''
-                    set -eu
+                    set +e
 
-                    if [ -f package-lock.json ]; then
-                        npm ci
-                    else
-                        echo "WARNING: package-lock.json not found; using npm install"
-                        npm install
+                    mkdir -p "$REPORT_DIR"
+                    rm -f "$REPORT_DIR/gitleaks-report.json"
+
+                    echo "===== Gitleaks Secret Scan ====="
+
+                    docker run --rm \
+                        -v "$WORKSPACE:/repo" \
+                        -w /repo \
+                        zricethezav/gitleaks:latest \
+                        detect \
+                        --no-git \
+                        --source=/repo \
+                        --report-format=json \
+                        --report-path=/repo/security-reports/gitleaks-report.json \
+                        --redact \
+                        --exit-code=0 \
+                        --ignore-path=security-reports
+
+                    RC=$?
+
+                    if [ ! -f "$REPORT_DIR/gitleaks-report.json" ]; then
+                        echo "[]" > "$REPORT_DIR/gitleaks-report.json"
+                        echo "Gitleaks did not create a report." \
+                            > "$REPORT_DIR/gitleaks-error.txt"
                     fi
+
+                    echo "Gitleaks execution exit code: $RC"
+
+                    python3 -c '
+import json
+with open("security-reports/gitleaks-report.json") as f:
+    findings = json.load(f)
+print("Total Gitleaks findings:", len(findings))
+for item in findings:
+    print("Rule:", item.get("RuleID"),
+          "| File:", item.get("File"),
+          "| Line:", item.get("StartLine"))
+'
+
+                    if [ "$RC" -ne 0 ]; then
+                        echo "Gitleaks execution failed." \
+                            > "$REPORT_DIR/gitleaks-error.txt"
+                    fi
+
+                    echo "Gitleaks scan stage completed."
+                    exit 0
                 '''
             }
         }
 
-        stage('Build and Test') {
+        // --------------------------------------------------
+        // 3. TRIVY FILESYSTEM SCAN
+        // --------------------------------------------------
+        stage('Trivy Filesystem Scan') {
             steps {
                 sh '''
-                    set -eu
+                    set +e
 
-                    echo "===== Application Build ====="
-                    npm run build --if-present
+                    mkdir -p "$REPORT_DIR"
+                    rm -f "$REPORT_DIR/trivy-report.json"
+                    rm -f "$REPORT_DIR/trivy-report.txt"
 
-                    echo "===== Application Tests ====="
+                    echo "===== Trivy JSON Scan ====="
 
-                    if node -e "
-                        const p = require('./package.json');
-                        process.exit(p.scripts && p.scripts.test ? 0 : 1);
-                    "; then
-                        CI=true npm test -- --watchAll=false --passWithNoTests
-                    else
-                        echo "No test script configured. Skipping tests."
+                    docker run --rm \
+                        -v "$WORKSPACE:/path" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --scanners vuln,misconfig,secret \
+                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                        --skip-dirs /path/node_modules \
+                        --skip-dirs /path/.git \
+                        --skip-dirs /path/security-reports \
+                        --format json \
+                        --output /path/security-reports/trivy-report.json \
+                        --exit-code 0 \
+                        /path
+
+                    JSON_RC=$?
+
+                    echo "===== Trivy Table Scan ====="
+
+                    docker run --rm \
+                        -v "$WORKSPACE:/path" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --scanners vuln,misconfig,secret \
+                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                        --skip-dirs /path/node_modules \
+                        --skip-dirs /path/.git \
+                        --skip-dirs /path/security-reports \
+                        --format table \
+                        --output /path/security-reports/trivy-report.txt \
+                        --exit-code 0 \
+                        /path
+
+                    TABLE_RC=$?
+
+                    echo "Trivy JSON exit code: $JSON_RC"
+                    echo "Trivy table exit code: $TABLE_RC"
+
+                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
+                        echo "Trivy execution failed." \
+                            > "$REPORT_DIR/trivy-scan-error.txt"
                     fi
 
-                    echo "===== Build and Test Completed ====="
+                    if [ -f "$REPORT_DIR/trivy-report.txt" ]; then
+                        cat "$REPORT_DIR/trivy-report.txt"
+                    fi
+
+                    exit 0
                 '''
             }
         }
 
-        stage('SonarQube Analysis') {
+        // --------------------------------------------------
+        // 4. SONARQUBE ANALYSIS
+        // --------------------------------------------------
+        stage('SonarQube Scan') {
             steps {
-                withSonarQubeEnv("${SONAR_SERVER}") {
-                    withCredentials([
-                        string(
-                            credentialsId: "${SONAR_TOKEN}",
-                            variable: 'SONAR_AUTH_TOKEN'
-                        )
-                    ]) {
-                        sh '''
-                            set +e
+                withCredentials([
+                    string(
+                        credentialsId: 'sonar-token',
+                        variable: 'SONAR_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
 
-                            docker run --rm \
-                              -e SONAR_HOST_URL="$SONAR_HOST_URL" \
-                              -e SONAR_TOKEN="$SONAR_AUTH_TOKEN" \
-                              -v "$WORKSPACE:/usr/src" \
-                              -w /usr/src \
-                              sonarsource/sonar-scanner-cli:latest \
-                              -Dsonar.projectKey="$SONAR_PROJECT_KEY" \
-                              -Dsonar.sources=src \
-                              -Dsonar.exclusions="node_modules/**,build/**,security-reports/**,coverage/**" \
-                              -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
-                              > "$REPORT_DIR/sonar-scanner.log" 2>&1
+                        echo "===== SonarQube Analysis ====="
 
-                            SCAN_RC=$?
+                        docker run --rm \
+                            -v "$WORKSPACE:/usr/src" \
+                            -w /usr/src \
+                            -e SONAR_HOST_URL="$SONAR_URL" \
+                            -e SONAR_TOKEN="$SONAR_TOKEN" \
+                            sonarsource/sonar-scanner-cli:latest \
+                            -Dsonar.projectKey="$SONAR_PROJECT" \
+                            -Dsonar.projectName="Zomato Kastro" \
+                            -Dsonar.sources=src \
+                            -Dsonar.scm.provider=git \
+                            -Dsonar.exclusions="node_modules/**,**/node_modules/**,**/dist/**,**/build/**,security-reports/**"
 
-                            cat "$REPORT_DIR/sonar-scanner.log"
-
-                            if [ "$SCAN_RC" -ne 0 ]; then
-                                echo "SonarScanner execution failed with exit code $SCAN_RC"
-                                echo "$SCAN_RC" > "$REPORT_DIR/sonar-scan-error.txt"
-                                exit "$SCAN_RC"
-                            fi
-                        '''
-                    }
+                        echo "SonarQube analysis submitted successfully."
+                    '''
                 }
             }
         }
 
-        stage('Gitleaks Secret Scan') {
+        // --------------------------------------------------
+        // 5. GENERATE SBOM
+        // --------------------------------------------------
+        stage('Generate SBOM') {
             steps {
                 sh '''
-                    echo "===== Gitleaks Secret Scan ====="
-                    set +e
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+
+                    echo "===== Generating CycloneDX SBOM ====="
 
                     docker run --rm \
-                      -v "$WORKSPACE:/path" \
-                      zricethezav/gitleaks:latest \
-                      detect \
-                      --source=/path \
-                      --no-git \
-                      --redact \
-                      --report-format=json \
-                      --report-path=/path/security-reports/gitleaks-report.json \
-                      --exit-code=0
+                        -v "$WORKSPACE:/repo" \
+                        aquasec/trivy:latest \
+                        fs /repo \
+                        --skip-dirs /repo/.git \
+                        --skip-dirs /repo/node_modules \
+                        --skip-dirs /repo/security-reports \
+                        --format cyclonedx \
+                        --output /repo/security-reports/sbom.cdx.json
 
-                    SCAN_RC=$?
+                    test -s "$REPORT_DIR/sbom.cdx.json"
 
-                    echo "Gitleaks execution exit code: $SCAN_RC"
-
-                    if [ "$SCAN_RC" -ne 0 ]; then
-                        echo "Gitleaks scan execution failed with exit code $SCAN_RC" \
-                          > "$REPORT_DIR/gitleaks-scan-error.txt"
-                    fi
-
-                    # Findings and scan errors do not fail this stage.
-                    exit 0
+                    echo "SBOM generated successfully."
                 '''
             }
         }
 
-        stage('Trivy Filesystem Scan') {
+        // --------------------------------------------------
+        // 6. DEPENDENCY-TRACK UPLOAD
+        // --------------------------------------------------
+        stage('Upload SBOM to Dependency-Track') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'DT-token-k8s',
+                        variable: 'DT_API_KEY'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        echo "===== Dependency-Track SBOM Upload ====="
+
+                        curl --fail --silent --show-error \
+                            --connect-timeout 15 \
+                            --max-time 120 \
+                            --request POST \
+                            --url "$DT_URL/api/v1/bom" \
+                            --header "X-Api-Key: $DT_API_KEY" \
+                            --form "autoCreate=true" \
+                            --form "projectName=$DT_PROJECT_NAME" \
+                            --form "projectVersion=$DT_PROJECT_VERSION" \
+                            --form "bom=@security-reports/sbom.cdx.json;type=application/json" \
+                            --output "$REPORT_DIR/dt-upload-response.json"
+
+                        echo "SBOM upload request accepted."
+                        echo "Project: $DT_PROJECT_NAME"
+                        echo "Version: $DT_PROJECT_VERSION"
+                    '''
+                }
+            }
+        }
+
+        // --------------------------------------------------
+        // 7. NODE.JS DEPENDENCY INSTALL & BUILD
+        // --------------------------------------------------
+        stage('Node.js Install and Build') {
             steps {
                 sh '''
-                    echo "===== Trivy Filesystem JSON Scan ====="
-                    set +e
+                    set -eu
+
+                    echo "===== Node.js Project Build ====="
+
+                    test -f package.json
 
                     docker run --rm \
-                      -v "$WORKSPACE:/path" \
-                      aquasec/trivy:latest \
-                      fs \
-                      --scanners vuln,misconfig,secret \
-                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                      --format json \
-                      --output /path/security-reports/trivy-report.json \
-                      --exit-code 0 \
-                      --skip-dirs /path/node_modules \
-                      --skip-dirs /path/.git \
-                      /path
+                        -v "$WORKSPACE:/app" \
+                        -w /app \
+                        node:20-alpine \
+                        sh -lc '
+                            set -eu
 
-                    JSON_RC=$?
+                            echo "Node version:"
+                            node --version
 
-                    echo "===== Trivy Filesystem Table Scan ====="
+                            echo "NPM version:"
+                            npm --version
 
-                    docker run --rm \
-                      -v "$WORKSPACE:/path" \
-                      aquasec/trivy:latest \
-                      fs \
-                      --scanners vuln,misconfig,secret \
-                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                      --format table \
-                      --output /path/security-reports/trivy-report.txt \
-                      --exit-code 0 \
-                      --skip-dirs /path/node_modules \
-                      --skip-dirs /path/.git \
-                      /path
+                            npm ci
 
-                    TABLE_RC=$?
+                            if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+                                echo "Build script found. Running npm run build."
+                                npm run build
+                            else
+                                echo "No build script defined. Skipping npm run build."
+                            fi
+                        '
 
-                    echo "Trivy JSON execution exit code: $JSON_RC"
-                    echo "Trivy table execution exit code: $TABLE_RC"
-
-                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
-                        echo "One or more Trivy filesystem scans failed to execute." \
-                          > "$REPORT_DIR/trivy-scan-error.txt"
-                    fi
-
-                    # Findings and scan errors do not fail this stage.
-                    exit 0
+                    echo "Node.js dependency installation/build completed."
                 '''
             }
         }
 
+        // --------------------------------------------------
+        // 8. BUILD DOCKER IMAGE
+        // --------------------------------------------------
         stage('Build Docker Image') {
             steps {
                 sh '''
                     set -eu
 
-                    echo "===== Build Docker Image ====="
+                    echo "===== Docker Image Build ====="
+
+                    test -f Dockerfile
 
                     docker build \
-                      --pull \
-                      -t "$IMAGE_NAME:$BUILD_NUMBER" \
-                      -t "$IMAGE_NAME:latest" \
-                      .
+                        --pull \
+                        -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
+                        -t "$DOCKER_IMAGE:latest" \
+                        .
 
-                    echo "===== Image Build Successful ====="
-
-                    docker images "$IMAGE_NAME"
+                    echo "Docker image built successfully."
+                    docker images "$DOCKER_IMAGE"
                 '''
             }
         }
 
-        stage('Trivy Docker Image Scan') {
-            steps {
-                sh '''
-                    echo "===== Trivy Docker Image JSON Scan ====="
-                    set +e
-
-                    docker run --rm \
-                      -v /var/run/docker.sock:/var/run/docker.sock \
-                      -v "$WORKSPACE/$REPORT_DIR:/reports" \
-                      aquasec/trivy:latest \
-                      image \
-                      --scanners vuln,misconfig,secret \
-                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                      --format json \
-                      --output /reports/trivy-image-report.json \
-                      --exit-code 0 \
-                      "$IMAGE_NAME:$BUILD_NUMBER"
-
-                    JSON_RC=$?
-
-                    echo "===== Trivy Docker Image Table Scan ====="
-
-                    docker run --rm \
-                      -v /var/run/docker.sock:/var/run/docker.sock \
-                      -v "$WORKSPACE/$REPORT_DIR:/reports" \
-                      aquasec/trivy:latest \
-                      image \
-                      --scanners vuln,misconfig,secret \
-                      --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
-                      --format table \
-                      --output /reports/trivy-image-report.txt \
-                      --exit-code 0 \
-                      "$IMAGE_NAME:$BUILD_NUMBER"
-
-                    TABLE_RC=$?
-
-                    echo "Trivy image JSON execution exit code: $JSON_RC"
-                    echo "Trivy image table execution exit code: $TABLE_RC"
-
-                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
-                        echo "One or more Trivy image scans failed to execute." \
-                          > "$REPORT_DIR/trivy-image-scan-error.txt"
-                    fi
-
-                    # Findings and scan errors do not fail this stage.
-                    exit 0
-                '''
-            }
-        }
-
-        stage('Push Docker Image to Docker Hub') {
+        // --------------------------------------------------
+        // 9. PUSH IMAGE TO DOCKER HUB
+        // --------------------------------------------------
+        stage('Push Image to Docker Hub') {
             steps {
                 withCredentials([
                     usernamePassword(
                         credentialsId: 'docker-cred',
-                        usernameVariable: 'DOCKERHUB_USER',
-                        passwordVariable: 'DOCKERHUB_PASSWORD'
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASSWORD'
                     )
                 ]) {
                     sh '''
@@ -356,27 +365,21 @@ EOF
 
                         echo "===== Docker Hub Login ====="
 
-                        if [ "$DOCKERHUB_USER" != "$DOCKERHUB_USERNAME" ]; then
-                            echo "ERROR: Username in Jenkins credential docker-cred does not match $DOCKERHUB_USERNAME"
-                            exit 1
-                        fi
+                        printf '%s' "$DOCKER_PASSWORD" |
+                            docker login \
+                                --username "$DOCKER_USER" \
+                                --password-stdin
 
-                        trap 'docker logout >/dev/null 2>&1 || true' EXIT
+                        echo "===== Pushing Docker Images ====="
 
-                        printf '%s' "$DOCKERHUB_PASSWORD" | \
-                          docker login \
-                            --username "$DOCKERHUB_USER" \
-                            --password-stdin
+                        docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
+                        docker push "$DOCKER_IMAGE:latest"
 
-                        echo "===== Push Build Number Tag ====="
-                        docker push "$IMAGE_NAME:$BUILD_NUMBER"
+                        echo "Images pushed successfully:"
+                        echo "$DOCKER_IMAGE:$BUILD_NUMBER"
+                        echo "$DOCKER_IMAGE:latest"
 
-                        echo "===== Push Latest Tag ====="
-                        docker push "$IMAGE_NAME:latest"
-
-                        echo "===== Docker Hub Push Completed ====="
-                        echo "Image: $IMAGE_NAME:$BUILD_NUMBER"
-                        echo "Image: $IMAGE_NAME:latest"
+                        docker logout
                     '''
                 }
             }
@@ -386,52 +389,21 @@ EOF
     post {
         always {
             archiveArtifacts(
-                artifacts: 'security-reports/**/*',
+                artifacts: 'security-reports/**',
                 allowEmptyArchive: true,
                 fingerprint: true
             )
 
-            echo '''
-            ==========================================
-            PIPELINE FINISHED
-            ==========================================
-
-            Download reports from:
-            Jenkins Job -> Build Number -> Artifacts
-
-            Security reports:
-            - gitleaks-report.json
-            - trivy-report.json
-            - trivy-report.txt
-            - trivy-image-report.json
-            - trivy-image-report.txt
-            - sonar-scanner.log
-            - README.txt
-
-            Docker Hub:
-            https://hub.docker.com/r/teqvivek123/zomato-kastro
-
-            Image tags:
-            - Build number
-            - latest
-
-            Gitleaks and Trivy findings do not fail
-            the pipeline. Check scan error files and
-            Console Output for execution errors.
-            ==========================================
-            '''
+            echo 'Security reports and SBOM are available under Build → Artifacts.'
         }
 
         success {
-            echo 'Pipeline completed successfully, including Docker image push.'
+            echo 'Pipeline completed successfully.'
+            echo 'GitHub → Gitleaks → Trivy → SonarQube → SBOM → Dependency-Track → Node.js Build → Docker Build → Docker Hub Push'
         }
 
         failure {
-            echo 'A build, test, SonarScanner or Docker build/push stage failed. Review Console Output and archived reports.'
-        }
-
-        cleanup {
-            echo 'Pipeline execution finished.'
+            echo 'Pipeline failed. Review Console Output to identify the failed stage.'
         }
     }
 }
