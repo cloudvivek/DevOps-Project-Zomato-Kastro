@@ -1,0 +1,118 @@
+
+pipeline {
+    agent {
+        label 'jenkins_agent'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+
+    environment {
+        GIT_URL    = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH = 'master'
+        REPORT_DIR = 'security-reports'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+            }
+        }
+
+        stage('Prepare Security Reports') {
+            steps {
+                sh '''
+                    mkdir -p "$REPORT_DIR"
+                    echo "Security report directory: $WORKSPACE/$REPORT_DIR"
+                '''
+            }
+        }
+
+        stage('Trivy Filesystem Scan') {
+            steps {
+                sh '''
+                    set +e
+
+                    echo "===== Trivy Filesystem JSON Scan ====="
+
+                    docker run --rm \
+                        -v "$WORKSPACE:/path" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --scanners vuln,misconfig,secret \
+                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                        --format json \
+                        --output /path/security-reports/trivy-report.json \
+                        --exit-code 0 \
+                        --skip-dirs /path/node_modules \
+                        --skip-dirs /path/.git \
+                        /path
+
+                    JSON_RC=$?
+
+                    echo "===== Trivy Filesystem Table Scan ====="
+
+                    docker run --rm \
+                        -v "$WORKSPACE:/path" \
+                        aquasec/trivy:latest \
+                        fs \
+                        --scanners vuln,misconfig,secret \
+                        --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
+                        --format table \
+                        --output /path/security-reports/trivy-report.txt \
+                        --exit-code 0 \
+                        --skip-dirs /path/node_modules \
+                        --skip-dirs /path/.git \
+                        /path
+
+                    TABLE_RC=$?
+
+                    echo "Trivy JSON execution exit code: $JSON_RC"
+                    echo "Trivy table execution exit code: $TABLE_RC"
+
+                    if [ "$JSON_RC" -ne 0 ] || [ "$TABLE_RC" -ne 0 ]; then
+                        echo "One or more Trivy scans failed." \
+                            > "$REPORT_DIR/trivy-scan-error.txt"
+                    fi
+
+                    echo "===== Generated Reports ====="
+                    ls -lh "$REPORT_DIR"
+
+                    # Keep the pipeline successful even if a scan fails.
+                    # The error report records execution failures.
+                    exit 0
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'security-reports/**',
+                allowEmptyArchive: true,
+                fingerprint: true
+            )
+
+            echo 'Trivy reports are available under Build → Artifacts.'
+        }
+
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Check Console Output for errors.'
+        }
+    }
+}
