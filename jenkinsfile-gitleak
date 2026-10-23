@@ -1,0 +1,123 @@
+
+pipeline {
+    agent {
+        label 'jenkins_agent'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+
+    environment {
+        GIT_URL    = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH = 'master'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+
+                echo "Repository: ${GIT_URL}"
+                echo "Branch: ${GIT_BRANCH}"
+
+                sh 'git log -1 --oneline'
+            }
+        }
+
+        stage('Gitleaks Secret Scan') {
+            steps {
+                script {
+                    sh '''
+                        set +e
+
+                        mkdir -p security-reports
+                        rm -f security-reports/gitleaks-report.json
+
+                        echo "======================================"
+                        echo "Starting Gitleaks Secret Scan"
+                        echo "Scan mode: Current files only"
+                        echo "======================================"
+
+                        docker run --rm \
+                            -v "$WORKSPACE:/repo" \
+                            -w /repo \
+                            zricethezav/gitleaks:latest \
+                            detect \
+                            --no-git \
+                            --source=/repo \
+                            --report-format=json \
+                            --report-path=/repo/security-reports/gitleaks-report.json \
+                            --redact \
+                            --exit-code=0
+
+                        SCAN_STATUS=$?
+
+                        if [ ! -f security-reports/gitleaks-report.json ]; then
+                            echo "[]" > security-reports/gitleaks-report.json
+                        fi
+
+                        echo ""
+                        echo "Gitleaks execution exit status: $SCAN_STATUS"
+
+                        echo "======================================"
+                        echo "Gitleaks Report Summary"
+                        echo "======================================"
+
+                        python3 -c '
+import json
+with open("security-reports/gitleaks-report.json") as f:
+    findings = json.load(f)
+
+if not isinstance(findings, list):
+    raise SystemExit("Unexpected Gitleaks report format")
+
+print("Total findings:", len(findings))
+
+for finding in findings:
+    print(
+        "Rule:", finding.get("RuleID", "unknown"),
+        "| File:", finding.get("File", "unknown"),
+        "| Line:", finding.get("StartLine", "unknown")
+    )
+'
+
+                        echo ""
+                        echo "Report: security-reports/gitleaks-report.json"
+                        echo "Scan stage will not fail because of detected secrets."
+
+                        exit 0
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts(
+                artifacts: 'security-reports/gitleaks-report.json',
+                allowEmptyArchive: false,
+                fingerprint: true
+            )
+
+            echo 'Gitleaks report archived. Open the build and download it from Artifacts.'
+        }
+
+        success {
+            echo 'Pipeline completed successfully.'
+        }
+
+        failure {
+            echo 'Pipeline failed. Check Console Output and artifact archiving.'
+        }
+    }
+}
