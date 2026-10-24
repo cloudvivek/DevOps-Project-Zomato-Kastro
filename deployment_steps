@@ -58,3 +58,61 @@ docker run -d --name sonarqube -p 9000:9000 sonarqube:lts-community
 
 
 jenkinsfile-
+------------------------------------------------------------------------------------------------------------------
+Deployment stage-
+Jenkins configuration
+Verify these credentials exist:
+- docker-cred — Docker Hub username/password.
+- kind-server-ssh — SSH private key and username for Server 2.
+
+
+
+kubectl port-forward --address 0.0.0.0 svc/zomato 3000:3000
+
+
+monitoring-
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+kubectl create namespace monitoring
+
+
+cat > monitoring-values.yaml <<'EOF'
+grafana:
+  enabled: true
+  adminUser: admin
+  adminPassword: "ReplaceWithYourStrongPassword123!"
+
+prometheus:
+  enabled: true
+  prometheusSpec:
+    retention: 7d
+
+alertmanager:
+  enabled: true
+
+nodeExporter:
+  enabled: true
+
+kubeStateMetrics:
+  enabled: true
+EOF
+
+
+helm upgrade --install monitoring \
+  prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  -f monitoring-values.yaml \
+  --wait \
+  --timeout 10m
+
+
+helm list -n monitoring
+kubectl get pods -n monitoring -o wide
+kubectl get svc -n monitoring
+
+kubectl port-forward --address 0.0.0.0 \
+  -n monitoring svc/monitoring-grafana 3001:80
+
+kubectl port-forward --address 0.0.0.0 \
+  -n monitoring svc/monitoring-kube-prometheus-prometheus 9090:9090
