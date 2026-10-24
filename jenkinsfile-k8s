@@ -1,0 +1,206 @@
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(
+            numToKeepStr: '10',
+            artifactNumToKeepStr: '5'
+        ))
+    }
+
+    environment {
+        // GitHub
+        GIT_URL       = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH    = 'master'
+
+        // Docker Hub
+        DOCKER_IMAGE  = 'teqvivek123/zomato-kastro'
+
+        // Kubernetes Server 2
+        K8S_HOST      = '3.110.108.155'
+        K8S_NAMESPACE = 'default'
+        K8S_MANIFESTS = '/tmp/zomato-kastro-deploy/Kubernetes'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                deleteDir()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_URL}"
+
+                sh '''
+                    set -eu
+
+                    echo "===== Git Checkout Successful ====="
+                    git log -1 --oneline
+
+                    echo "===== Validating Project Files ====="
+                    test -f Dockerfile
+                    test -f Kubernetes/deployment.yaml
+                    test -f Kubernetes/service.yaml
+
+                    echo "===== Application Manifests ====="
+                    ls -l Kubernetes/deployment.yaml Kubernetes/service.yaml
+                '''
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "===== Building Docker Image ====="
+
+                    docker build --pull \
+                        -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
+                        -t "$DOCKER_IMAGE:latest" \
+                        .
+
+                    echo "===== Docker Image Built Successfully ====="
+                    docker images "$DOCKER_IMAGE"
+                '''
+            }
+        }
+
+        stage('Push Image to Docker Hub') {
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'docker-cred',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+                        set +x
+
+                        echo "===== Logging in to Docker Hub ====="
+
+                        printf '%s' "$DOCKER_PASSWORD" |
+                            docker login \
+                                --username "$DOCKER_USER" \
+                                --password-stdin
+
+                        echo "===== Pushing Versioned Image ====="
+                        docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
+
+                        echo "===== Pushing Latest Image ====="
+                        docker push "$DOCKER_IMAGE:latest"
+
+                        docker logout
+
+                        echo "===== Docker Hub Push Completed ====="
+                        echo "Image: $DOCKER_IMAGE:$BUILD_NUMBER"
+                        echo "Image: $DOCKER_IMAGE:latest"
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to kind Kubernetes') {
+            steps {
+                withCredentials([
+                    sshUserPrivateKey(
+                        credentialsId: 'kind-server-ssh',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USER'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "===== Checking Kubernetes Connectivity ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            -o ConnectTimeout=15 \
+                            "$SSH_USER@$K8S_HOST" \
+                            'kubectl get nodes'
+
+                        echo "===== Preparing Remote Directory ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "mkdir -p '$K8S_MANIFESTS'"
+
+                        echo "===== Copying Zomato Manifests Only ====="
+
+                        scp -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            Kubernetes/deployment.yaml \
+                            Kubernetes/service.yaml \
+                            "$SSH_USER@$K8S_HOST:$K8S_MANIFESTS/"
+
+                        echo "===== Applying Deployment ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "kubectl apply -f '$K8S_MANIFESTS/deployment.yaml' -n '$K8S_NAMESPACE'"
+
+                        echo "===== Applying Service ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "kubectl apply -f '$K8S_MANIFESTS/service.yaml' -n '$K8S_NAMESPACE'"
+
+                        echo "===== Updating Zomato Image ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "kubectl set image deployment/zomato zomato=$DOCKER_IMAGE:$BUILD_NUMBER -n '$K8S_NAMESPACE'"
+
+                        echo "===== Waiting for Deployment Rollout ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "kubectl rollout status deployment/zomato -n '$K8S_NAMESPACE' --timeout=180s"
+
+                        echo "===== Kubernetes Deployment Status ====="
+
+                        ssh -i "$SSH_KEY" \
+                            -o BatchMode=yes \
+                            -o StrictHostKeyChecking=accept-new \
+                            "$SSH_USER@$K8S_HOST" \
+                            "kubectl get deployments,pods,services -n '$K8S_NAMESPACE' -o wide"
+
+                        echo "===== Zomato Deployment Completed Successfully ====="
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'SUCCESS: Docker image built, pushed to Docker Hub, and deployed to kind Kubernetes.'
+        }
+
+        failure {
+            echo 'FAILURE: Check the Jenkins Console Output for the failing stage.'
+        }
+
+        always {
+            echo 'Jenkins pipeline execution finished.'
+        }
+    }
+}
