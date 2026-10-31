@@ -19,11 +19,11 @@ pipeline {
         GIT_BRANCH       = 'master'
 
         // SonarQube
-        SONAR_URL        = 'http://15.206.75.174:9000'
+        SONAR_URL        = 'http://13.201.125.122:9000'
         SONAR_PROJECT    = 'zomato-kastro'
 
         // Dependency-Track
-        DT_URL           = 'http://15.206.75.174:8087'
+        DT_URL           = 'http://13.201.125.122:8087'
         DT_PROJECT_NAME  = 'DevOps-Project-Zomato-Kastro'
         DT_PROJECT_VERSION = 'master'
 
