@@ -1,6 +1,5 @@
-# Test secret for Gitleaks detection
 AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
-AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-DB_PASSWORD=SuperSecret@123456
-API_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
-JWT_SECRET=my_super_secret_jwt_signing_key_123456789
+AWS_SECRET_ACCESS_KEY=K7mP9xQ2vL8nR4tY6uW1aB5cD0eF3gHj
+GITHUB_TOKEN=ghp_1234567890abcdef1234567890abcdef1234
+DATABASE_URL=postgresql://admin:MyRealisticDBPassword123!@localhost:5432/myapp
+JWT_SECRET=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyIjoiYWRtaW4ifQ.signature123456789
