@@ -1,0 +1,6 @@
+# Test secret for Gitleaks detection
+AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE
+AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
+DB_PASSWORD=SuperSecret@123456
+API_TOKEN=ghp_1234567890abcdefghijklmnopqrstuvwxyz
+JWT_SECRET=my_super_secret_jwt_signing_key_123456789
