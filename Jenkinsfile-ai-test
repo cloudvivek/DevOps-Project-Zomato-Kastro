@@ -1,0 +1,40 @@
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        GIT_URL = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH = 'ai-agent-test'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                deleteDir()
+                git branch: "${GIT_BRANCH}", url: "${GIT_URL}"
+            }
+        }
+
+        stage('Node.js Build') {
+            steps {
+                sh '''
+                    docker run --rm \
+                      -v "$WORKSPACE:/app" \
+                      -w /app \
+                      node:20-alpine \
+                      sh -lc 'set -eu; npm ci; npm run build'
+                '''
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh 'docker build --pull -t ai-agent-test:${BUILD_NUMBER} .'
+            }
+        }
+    }
+}
