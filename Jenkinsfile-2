@@ -108,44 +108,6 @@ pipeline {
                 '''
             }
         }
-
-        // --------------------------------------------------
-        // 4. PUSH IMAGE TO DOCKER HUB
-        // --------------------------------------------------
-        stage('Push Image to Docker Hub') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'docker-cred',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASSWORD'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
-                        set +x
-
-                        echo "===== Docker Hub Login ====="
-
-                        printf '%s' "$DOCKER_PASSWORD" |
-                            docker login \
-                                --username "$DOCKER_USER" \
-                                --password-stdin
-
-                        echo "===== Pushing Docker Images ====="
-
-                        docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
-                        docker push "$DOCKER_IMAGE:latest"
-
-                        echo "Images pushed successfully:"
-                        echo "$DOCKER_IMAGE:$BUILD_NUMBER"
-                        echo "$DOCKER_IMAGE:latest"
-
-                        docker logout
-                    '''
-                }
-            }
-        }
     }
 
     post {
