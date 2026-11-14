@@ -23,7 +23,7 @@ pipeline {
         // Build log
         BUILD_LOG = 'build_output.log'
 
-        // AI Self-Healing
+        // Local Ollama
         OLLAMA_MODEL = 'qwen2.5-coder:3b'
         OLLAMA_URL = 'http://localhost:11434/api/generate'
     }
@@ -42,11 +42,11 @@ set -Eeuo pipefail
 # Initialize build log
 : > "$WORKSPACE/$BUILD_LOG"
 
-# Capture all output in console and build log
+# Capture output in console and build log
 exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
 echo "=========================================="
-echo "          CHECKOUT STAGE"
+echo "             CHECKOUT STAGE"
 echo "=========================================="
 
 echo "Repository: $GIT_URL"
@@ -121,7 +121,9 @@ docker run --rm \
         echo ""
         echo "Checking build script..."
 
-        if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+        BUILD_SCRIPT=$(npm pkg get scripts.build)
+
+        if [ "$BUILD_SCRIPT" != "undefined" ] && [ "$BUILD_SCRIPT" != "{}" ]; then
             echo "Build script found."
             npm run build
         else
@@ -154,6 +156,9 @@ test -f Dockerfile
 
 echo "Building Docker image..."
 
+# INTENTIONAL ERROR FOR AI SIMULATION
+# Change docker builds to docker build after testing.
+
 docker builds \
     --pull \
     -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
@@ -162,7 +167,6 @@ docker builds \
 
 echo ""
 echo "Docker images created:"
-
 docker images "$DOCKER_IMAGE"
 
 echo ""
@@ -181,14 +185,7 @@ echo "Docker image build completed successfully."
         failure {
             echo 'AI Self-Healing Agent triggered.'
 
-            withCredentials([
-                string(
-                    credentialsId: 'github-token',
-                    variable: 'GITHUB_TOKEN'
-                )
-            ]) {
-
-                sh '''#!/bin/bash
+            sh '''#!/bin/bash
 set -u
 
 echo "=========================================="
@@ -199,38 +196,31 @@ LOG_FILE="$WORKSPACE/$BUILD_LOG"
 
 echo "Build number: $BUILD_NUMBER"
 echo "Build log: $LOG_FILE"
+echo "Ollama model: $OLLAMA_MODEL"
+echo "Ollama URL: $OLLAMA_URL"
 
-if [ -s "$LOG_FILE" ]; then
-
-    echo ""
-    echo "Build log found."
-    echo "Last 100 lines of build output:"
-
-    tail -n 100 "$LOG_FILE"
-
-    echo ""
-    echo "Invoking AI self-healing agent..."
-
-    export BUILD_NUMBER
-    export GIT_BRANCH
-    export OLLAMA_MODEL
-    export OLLAMA_URL
-
-    bash ./self_heal.sh "$LOG_FILE" || {
-        echo "WARNING: AI self-healing encountered an issue."
-    }
-
-else
-
+if [ ! -s "$LOG_FILE" ]; then
     echo "ERROR: Build log is missing or empty."
-    echo "AI agent cannot analyze this failure."
-
+    exit 1
 fi
+
+echo ""
+echo "Build log successfully captured."
+
+echo ""
+echo "Last 100 lines of Jenkins output:"
+tail -n 100 "$LOG_FILE"
+
+echo ""
+echo "Invoking local Ollama self-healing agent..."
+
+bash "$WORKSPACE/self_heal.sh" "$LOG_FILE" || {
+    echo "WARNING: Ollama analysis encountered an issue."
+}
 
 echo ""
 echo "AI self-healing execution finished."
 '''
-            }
         }
 
         always {
