@@ -39,14 +39,14 @@ pipeline {
                 sh '''#!/bin/bash
 set -Eeuo pipefail
 
-# Initialize build log
+# Initialize log for this build
 : > "$WORKSPACE/$BUILD_LOG"
 
-# Capture output in console and build log
+# Capture output in console and log
 exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
 echo "=========================================="
-echo "             CHECKOUT STAGE"
+echo "              CHECKOUT STAGE"
 echo "=========================================="
 
 echo "Repository: $GIT_URL"
@@ -85,7 +85,7 @@ set -Eeuo pipefail
 exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
 echo "=========================================="
-echo "       NODE.JS INSTALL AND BUILD"
+echo "         NODE.JS INSTALL AND BUILD"
 echo "=========================================="
 
 test -f package.json
@@ -149,25 +149,34 @@ set -Eeuo pipefail
 exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
 echo "=========================================="
-echo "          DOCKER IMAGE BUILD"
+echo "           DOCKER IMAGE BUILD"
 echo "=========================================="
 
 test -f Dockerfile
 
-echo "Building Docker image..."
+echo ""
+echo "=========================================="
+echo "          INTENTIONAL FAILURE TEST"
+echo "=========================================="
+
+echo "Image: $DOCKER_IMAGE"
+echo "Build: $BUILD_NUMBER"
+
+echo ""
+echo "Executing Docker command:"
+
+echo "docker builds --pull -t $DOCKER_IMAGE:$BUILD_NUMBER -t $DOCKER_IMAGE:latest ."
+
+echo ""
+echo "Starting Docker image build..."
 
 # INTENTIONAL ERROR FOR AI SIMULATION
-# Change docker builds to docker build after testing.
-
+# Correct command would be: docker build
 docker builds \
     --pull \
     -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
     -t "$DOCKER_IMAGE:latest" \
     .
-
-echo ""
-echo "Docker images created:"
-docker images "$DOCKER_IMAGE"
 
 echo ""
 echo "Docker image build completed successfully."
@@ -194,10 +203,10 @@ echo "=========================================="
 
 LOG_FILE="$WORKSPACE/$BUILD_LOG"
 
-echo "Build number: $BUILD_NUMBER"
-echo "Build log: $LOG_FILE"
-echo "Ollama model: $OLLAMA_MODEL"
-echo "Ollama URL: $OLLAMA_URL"
+echo "Build number : $BUILD_NUMBER"
+echo "Build log    : $LOG_FILE"
+echo "AI model     : $OLLAMA_MODEL"
+echo "Ollama URL   : $OLLAMA_URL"
 
 if [ ! -s "$LOG_FILE" ]; then
     echo "ERROR: Build log is missing or empty."
@@ -208,19 +217,35 @@ echo ""
 echo "Build log successfully captured."
 
 echo ""
-echo "Last 100 lines of Jenkins output:"
-tail -n 100 "$LOG_FILE"
+echo "Failure details:"
+grep -E 'Executing Docker command:|docker builds|unknown flag|not a docker command' \
+    "$LOG_FILE" | tail -n 20 || true
 
 echo ""
-echo "Invoking local Ollama self-healing agent..."
+echo "Invoking Ollama AI analyzer..."
 
-bash "$WORKSPACE/self_heal.sh" "$LOG_FILE" || {
-    echo "WARNING: Ollama analysis encountered an issue."
-}
+AI_STATUS=0
+
+bash "$WORKSPACE/self_heal.sh" "$LOG_FILE" || AI_STATUS=$?
+
+if [ "$AI_STATUS" -ne 0 ]; then
+    echo "WARNING: AI analysis failed with exit code $AI_STATUS."
+else
+    echo "AI analysis completed."
+fi
 
 echo ""
-echo "AI self-healing execution finished."
+echo "Archiving AI analysis report..."
+
+echo "=========================================="
+echo "AI SELF-HEALING EXECUTION FINISHED"
+echo "=========================================="
 '''
+
+            archiveArtifacts(
+                artifacts: 'ai-reports/*.md',
+                allowEmptyArchive: true
+            )
         }
 
         always {
