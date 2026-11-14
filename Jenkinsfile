@@ -23,21 +23,29 @@ pipeline {
     stages {
 
         // 1. CHECKOUT
+        // Declarative Pipeline already performs SCM checkout.
+        // Avoid deleteDir() and redundant Git checkout.
         stage('Checkout') {
             steps {
-                deleteDir()
-
-                git branch: "${GIT_BRANCH}",
-                    url: "${GIT_URL}"
-
                 sh '''
+                    set -eu
+
                     echo "======================================"
                     echo "GitHub Checkout Successful"
                     echo "======================================"
 
                     git log -1 --oneline
+
                     echo "Repository: $GIT_URL"
                     echo "Branch: $GIT_BRANCH"
+
+                    echo "Checking required files..."
+
+                    test -f package.json
+                    test -f Dockerfile
+                    test -f self_heal.sh
+
+                    echo "All required files are available."
                 '''
             }
         }
@@ -52,7 +60,8 @@ pipeline {
 
                     test -f package.json
 
-                    docker run --rm \
+                    docker rum --rm \
+                        --user "$(id -u):$(id -g)" \
                         -v "$WORKSPACE:/app" \
                         -w /app \
                         node:20-alpine \
@@ -65,6 +74,7 @@ pipeline {
                             echo "NPM version:"
                             npm --version
 
+                            echo "Installing dependencies..."
                             npm ci
 
                             if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
@@ -90,7 +100,7 @@ pipeline {
 
                     test -f Dockerfile
 
-                    docker buil \
+                    docker build \
                         --pull \
                         -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
                         -t "$DOCKER_IMAGE:latest" \
@@ -109,7 +119,16 @@ pipeline {
         failure {
             echo '🤖 Pipeline failed — invoking self-healing stage...'
 
-            sh 'bash ./self_heal.sh || echo "Self-heal script encountered an issue, see logs above."'
+            sh '''
+                if [ -f ./self_heal.sh ]; then
+                    bash ./self_heal.sh || {
+                        echo "Self-heal script encountered an issue."
+                    }
+                else
+                    echo "ERROR: self_heal.sh not found in workspace."
+                    echo "Cannot invoke self-healing."
+                fi
+            '''
         }
 
         always {
