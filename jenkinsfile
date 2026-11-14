@@ -7,6 +7,8 @@ pipeline {
     options {
         timestamps()
         disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+
         buildDiscarder(logRotator(
             numToKeepStr: '10',
             artifactNumToKeepStr: '5'
@@ -15,23 +17,24 @@ pipeline {
 
     environment {
         // GitHub
-        GIT_URL          = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
-        GIT_BRANCH       = 'master'
+        GIT_URL             = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH          = 'master'
 
         // SonarQube
-        SONAR_URL        = 'http://13.201.125.122:9000'
-        SONAR_PROJECT    = 'zomato-kastro'
+        SONAR_URL           = 'http://13.201.125.122:9000'
+        SONAR_PROJECT       = 'zomato-kastro'
 
         // Dependency-Track
-        DT_URL           = 'http://13.201.125.122:8087'
-        DT_PROJECT_NAME  = 'DevOps-Project-Zomato-Kastro'
-        DT_PROJECT_VERSION = 'master'
+        DT_URL              = 'http://13.201.125.122:8087'
+        DT_PROJECT_NAME     = 'DevOps-Project-Zomato-Kastro'
+        DT_PROJECT_VERSION  = 'master'
 
         // Docker Hub
-        DOCKER_IMAGE     = 'teqvivek123/zomato-kastro'
+        DOCKER_IMAGE        = 'teqvivek123/zomato-kastro'
 
-        // Reports
-        REPORT_DIR       = 'security-reports'
+        // Reports and AI
+        REPORT_DIR          = 'security-reports'
+        BUILD_LOG           = 'build_output.log'
     }
 
     stages {
@@ -41,21 +44,41 @@ pipeline {
         // --------------------------------------------------
         stage('Checkout') {
             steps {
-                deleteDir()
+                sh '''
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    mkdir -p "$WORKSPACE"
+                    : > "$WORKSPACE/$BUILD_LOG"
+
+                    echo "Build log initialized."
+                '''
 
                 git branch: "${GIT_BRANCH}",
                     url: "${GIT_URL}"
 
                 sh '''
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
+
                     echo "======================================"
                     echo "GitHub Checkout Successful"
                     echo "======================================"
 
                     git log -1 --oneline
+
                     echo "Repository: $GIT_URL"
                     echo "Branch: $GIT_BRANCH"
 
                     mkdir -p "$REPORT_DIR"
+
+                    test -f package.json
+                    test -f Dockerfile
+                    test -f self_heal.sh
+
+                    echo "Required files verified."
                 '''
             }
         }
@@ -66,6 +89,11 @@ pipeline {
         stage('Gitleaks Secret Scan') {
             steps {
                 sh '''
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
+
                     set +e
 
                     mkdir -p "$REPORT_DIR"
@@ -74,6 +102,7 @@ pipeline {
                     echo "===== Gitleaks Secret Scan ====="
 
                     docker run --rm \
+                        --user "$(id -u):$(id -g)" \
                         -v "$WORKSPACE:/repo" \
                         -w /repo \
                         zricethezav/gitleaks:latest \
@@ -112,7 +141,7 @@ for item in findings:
                             > "$REPORT_DIR/gitleaks-error.txt"
                     fi
 
-                    echo "Gitleaks scan stage completed."
+                    echo "Gitleaks scan completed."
                     exit 0
                 '''
             }
@@ -124,6 +153,11 @@ for item in findings:
         stage('Trivy Filesystem Scan') {
             steps {
                 sh '''
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
+
                     set +e
 
                     mkdir -p "$REPORT_DIR"
@@ -133,9 +167,12 @@ for item in findings:
                     echo "===== Trivy JSON Scan ====="
 
                     docker run --rm \
+                        --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
                         -v "$WORKSPACE:/path" \
                         aquasec/trivy:latest \
                         fs \
+                        --cache-dir /tmp/trivy-cache \
                         --scanners vuln,misconfig,secret \
                         --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
                         --skip-dirs /path/node_modules \
@@ -151,9 +188,12 @@ for item in findings:
                     echo "===== Trivy Table Scan ====="
 
                     docker run --rm \
+                        --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
                         -v "$WORKSPACE:/path" \
                         aquasec/trivy:latest \
                         fs \
+                        --cache-dir /tmp/trivy-cache \
                         --scanners vuln,misconfig,secret \
                         --severity UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL \
                         --skip-dirs /path/node_modules \
@@ -178,6 +218,7 @@ for item in findings:
                         cat "$REPORT_DIR/trivy-report.txt"
                     fi
 
+                    echo "Trivy scan completed."
                     exit 0
                 '''
             }
@@ -195,11 +236,16 @@ for item in findings:
                     )
                 ]) {
                     sh '''
-                        set -eu
+                        #!/bin/bash
+                        set -Eeuo pipefail
+
+                        exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                         echo "===== SonarQube Analysis ====="
 
                         docker run --rm \
+                            --user "$(id -u):$(id -g)" \
+                            -e HOME=/tmp \
                             -v "$WORKSPACE:/usr/src" \
                             -w /usr/src \
                             -e SONAR_HOST_URL="$SONAR_URL" \
@@ -223,16 +269,22 @@ for item in findings:
         stage('Generate SBOM') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                     mkdir -p "$REPORT_DIR"
 
                     echo "===== Generating CycloneDX SBOM ====="
 
                     docker run --rm \
+                        --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
                         -v "$WORKSPACE:/repo" \
                         aquasec/trivy:latest \
                         fs /repo \
+                        --cache-dir /tmp/trivy-cache \
                         --skip-dirs /repo/.git \
                         --skip-dirs /repo/node_modules \
                         --skip-dirs /repo/security-reports \
@@ -258,8 +310,11 @@ for item in findings:
                     )
                 ]) {
                     sh '''
-                        set -eu
+                        #!/bin/bash
+                        set -Eeuo pipefail
                         set +x
+
+                        exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                         echo "===== Dependency-Track SBOM Upload ====="
 
@@ -284,18 +339,24 @@ for item in findings:
         }
 
         // --------------------------------------------------
-        // 7. NODE.JS DEPENDENCY INSTALL & BUILD
+        // 7. NODE.JS INSTALL & BUILD
         // --------------------------------------------------
         stage('Node.js Install and Build') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                     echo "===== Node.js Project Build ====="
 
                     test -f package.json
 
                     docker run --rm \
+                        --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
+                        -e NPM_CONFIG_CACHE=/tmp/npm-cache \
                         -v "$WORKSPACE:/app" \
                         -w /app \
                         node:20-alpine \
@@ -308,17 +369,18 @@ for item in findings:
                             echo "NPM version:"
                             npm --version
 
+                            echo "Installing dependencies..."
                             npm ci
 
                             if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
                                 echo "Build script found. Running npm run build."
                                 npm run build
                             else
-                                echo "No build script defined. Skipping npm run build."
+                                echo "No build script defined. Skipping build."
                             fi
                         '
 
-                    echo "Node.js dependency installation/build completed."
+                    echo "Node.js build completed."
                 '''
             }
         }
@@ -329,7 +391,10 @@ for item in findings:
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                     echo "===== Docker Image Build ====="
 
@@ -342,6 +407,7 @@ for item in findings:
                         .
 
                     echo "Docker image built successfully."
+
                     docker images "$DOCKER_IMAGE"
                 '''
             }
@@ -360,8 +426,11 @@ for item in findings:
                     )
                 ]) {
                     sh '''
-                        set -eu
+                        #!/bin/bash
+                        set -Eeuo pipefail
                         set +x
+
+                        exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                         echo "===== Docker Hub Login ====="
 
@@ -375,9 +444,7 @@ for item in findings:
                         docker push "$DOCKER_IMAGE:$BUILD_NUMBER"
                         docker push "$DOCKER_IMAGE:latest"
 
-                        echo "Images pushed successfully:"
-                        echo "$DOCKER_IMAGE:$BUILD_NUMBER"
-                        echo "$DOCKER_IMAGE:latest"
+                        echo "Images pushed successfully."
 
                         docker logout
                     '''
@@ -386,7 +453,11 @@ for item in findings:
         }
     }
 
+    // --------------------------------------------------
+    // POST ACTIONS
+    // --------------------------------------------------
     post {
+
         always {
             archiveArtifacts(
                 artifacts: 'security-reports/**',
@@ -394,7 +465,8 @@ for item in findings:
                 fingerprint: true
             )
 
-            echo 'Security reports and SBOM are available under Build → Artifacts.'
+            echo 'Security reports and SBOM archive completed.'
+            echo 'Pipeline execution completed.'
         }
 
         success {
@@ -403,7 +475,31 @@ for item in findings:
         }
 
         failure {
-            echo 'Pipeline failed. Review Console Output to identify the failed stage.'
+            echo '🤖 Pipeline failed — invoking AI self-healing agent...'
+
+            withCredentials([
+                string(
+                    credentialsId: 'github-token',
+                    variable: 'GITHUB_TOKEN'
+                )
+            ]) {
+                sh '''
+                    #!/bin/bash
+
+                    echo "======================================"
+                    echo "SELF-HEALING AGENT"
+                    echo "======================================"
+
+                    if [ -s "$WORKSPACE/$BUILD_LOG" ] && [ -f self_heal.sh ]; then
+                        bash ./self_heal.sh "$WORKSPACE/$BUILD_LOG" || {
+                            echo "Self-healing encountered an issue."
+                        }
+                    else
+                        echo "Build log or self_heal.sh is missing."
+                        echo "AI self-healing cannot continue."
+                    fi
+                '''
+            }
         }
     }
 }
