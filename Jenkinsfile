@@ -154,7 +154,7 @@ test -f Dockerfile
 
 echo "Building Docker image..."
 
-docker build \
+docker builds \
     --pull \
     -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
     -t "$DOCKER_IMAGE:latest" \
