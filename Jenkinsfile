@@ -18,17 +18,25 @@ pipeline {
 
         // Docker Hub
         DOCKER_IMAGE = 'teqvivek123/zomato-kastro'
+
+        // Build error log
+        BUILD_LOG    = 'build_output.log'
     }
 
     stages {
 
         // 1. CHECKOUT
-        // Declarative Pipeline already performs SCM checkout.
-        // Avoid deleteDir() and redundant Git checkout.
         stage('Checkout') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
+
+                    # Start a fresh build log
+                    : > "$WORKSPACE/$BUILD_LOG"
+
+                    # Capture output in Jenkins console and log file
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
 
                     echo "======================================"
                     echo "GitHub Checkout Successful"
@@ -54,14 +62,23 @@ pipeline {
         stage('Node.js Install and Build') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
 
-                    echo "===== Node.js Project Build ====="
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
+
+                    echo "======================================"
+                    echo "Node.js Project Build"
+                    echo "======================================"
 
                     test -f package.json
 
-                    docker rum --rm \
+                    echo "Starting Node.js Docker container..."
+
+                    docker run --rm \
                         --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
+                        -e NPM_CONFIG_CACHE=/tmp/.npm \
                         -v "$WORKSPACE:/app" \
                         -w /app \
                         node:20-alpine \
@@ -78,10 +95,10 @@ pipeline {
                             npm ci
 
                             if node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
-                                echo "Build script found. Running npm run build."
+                                echo "Build script found."
                                 npm run build
                             else
-                                echo "No build script defined. Skipping npm run build."
+                                echo "No build script found. Skipping build."
                             fi
                         '
 
@@ -94,13 +111,18 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 sh '''
-                    set -eu
+                    #!/bin/bash
+                    set -Eeuo pipefail
 
-                    echo "===== Docker Image Build ====="
+                    exec > >(tee -a "$WORKSPACE/$BUILD_LOG") 2>&1
+
+                    echo "======================================"
+                    echo "Docker Image Build"
+                    echo "======================================"
 
                     test -f Dockerfile
 
-                    docker build \
+                    docker bui \
                         --pull \
                         -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
                         -t "$DOCKER_IMAGE:latest" \
@@ -116,17 +138,32 @@ pipeline {
 
     // SELF-HEALING POST ACTIONS
     post {
+
         failure {
-            echo '🤖 Pipeline failed — invoking self-healing stage...'
+            echo '🤖 Pipeline failed — invoking self-healing agent...'
 
             sh '''
-                if [ -f ./self_heal.sh ]; then
-                    bash ./self_heal.sh || {
-                        echo "Self-heal script encountered an issue."
+                #!/bin/bash
+
+                echo "======================================"
+                echo "SELF-HEALING EXECUTION"
+                echo "======================================"
+
+                LOG_FILE="$WORKSPACE/$BUILD_LOG"
+
+                if [ -s "$LOG_FILE" ]; then
+                    echo "Build log found: $LOG_FILE"
+                    echo "Last 100 lines of build output:"
+                    tail -n 100 "$LOG_FILE"
+
+                    echo "Invoking AI self-healing agent..."
+
+                    bash ./self_heal.sh "$LOG_FILE" || {
+                        echo "Self-healing agent encountered an issue."
                     }
                 else
-                    echo "ERROR: self_heal.sh not found in workspace."
-                    echo "Cannot invoke self-healing."
+                    echo "ERROR: Build log is missing or empty."
+                    echo "Cannot provide error details to AI agent."
                 fi
             '''
         }
