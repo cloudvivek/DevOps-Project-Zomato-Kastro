@@ -96,7 +96,7 @@ pipeline {
 
                     test -f Dockerfile
 
-                    docker build \
+                    docker buil \
                         --pull \
                         -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
                         -t "$DOCKER_IMAGE:latest" \
