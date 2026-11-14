@@ -1,177 +1,577 @@
+
 #!/bin/bash
-set -e
 
-BUILD_LOG="build_output.log"
+set -Eeuo pipefail
+
+# ==========================================================
+# JENKINS AI SELF-HEALING AGENT
+# Ollama + Qwen2.5 Coder 3B + GitHub Pull Request
+# ==========================================================
+
+# ----------------------------------------------------------
+# CONFIGURATION
+# ----------------------------------------------------------
+
+BUILD_NUMBER="${BUILD_NUMBER:-manual}"
+GIT_BRANCH="${GIT_BRANCH:-master}"
+
+MODEL="${OLLAMA_MODEL:-qwen2.5-coder:3b}"
+OLLAMA_URL="${OLLAMA_URL:-http://localhost:11434/api/generate}"
+
+BUILD_LOG="${1:-${WORKSPACE:-$PWD}/build_output.log}"
+
 BRANCH="fix/auto-${BUILD_NUMBER}"
-OLLAMA_URL="http://localhost:11434/api/generate"
-MODEL="qwen2.5-coder:3b"
 
-echo "🩺 Self-heal triggered for build ${BUILD_NUMBER}"
+TEMP_FILE=""
 
-ERROR_LOG=$(tail -n 60 "${BUILD_LOG}" 2>/dev/null || echo "No log captured")
+# ----------------------------------------------------------
+# LOGGING
+# ----------------------------------------------------------
 
-echo "=== Captured error log ==="
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+cleanup() {
+    if [[ -n "$TEMP_FILE" && -f "$TEMP_FILE" ]]; then
+        rm -f "$TEMP_FILE"
+    fi
+}
+
+trap cleanup EXIT
+
+log "=================================================="
+log "          JENKINS AI SELF-HEALING AGENT"
+log "=================================================="
+
+log "Build Number : $BUILD_NUMBER"
+log "Model        : $MODEL"
+log "Base Branch  : $GIT_BRANCH"
+log "Fix Branch   : $BRANCH"
+log "Build Log    : $BUILD_LOG"
+
+# ----------------------------------------------------------
+# 1. VERIFY REQUIREMENTS
+# ----------------------------------------------------------
+
+log "Checking required commands..."
+
+for CMD in curl jq git gh python3; do
+    if ! command -v "$CMD" >/dev/null 2>&1; then
+        log "ERROR: Required command missing: $CMD"
+        exit 1
+    fi
+done
+
+if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+    log "ERROR: GITHUB_TOKEN is missing."
+    exit 1
+fi
+
+if [[ ! -s "$BUILD_LOG" ]]; then
+    log "ERROR: Build log missing or empty."
+    exit 1
+fi
+
+if [[ ! -d .git ]]; then
+    log "ERROR: Git repository not found."
+    exit 1
+fi
+
+if ! curl -fsS --connect-timeout 10 \
+    "${OLLAMA_URL%/api/generate}/api/tags" >/dev/null 2>&1; then
+    log "ERROR: Ollama API is not reachable."
+    exit 1
+fi
+
+log "All prerequisites verified."
+
+# ----------------------------------------------------------
+# 2. CAPTURE JENKINS BUILD ERROR
+# ----------------------------------------------------------
+
+log "Capturing Jenkins build failure..."
+
+ERROR_LOG=$(tail -n 150 "$BUILD_LOG")
+
+echo
+echo "========== JENKINS BUILD ERROR =========="
 echo "$ERROR_LOG"
-echo "==========================="
+echo "========================================="
 
-# ── 1. Identify the broken file ─────────────────────────────────────────
-BROKEN_FILE=$(echo "$ERROR_LOG" | grep -oE '[a-zA-Z0-9_./-]+\.java' | head -n1 | sed 's#^\./##')
+# ----------------------------------------------------------
+# 3. IDENTIFY BROKEN FILE
+# ----------------------------------------------------------
 
-if [[ -z "$BROKEN_FILE" || ! -f "$BROKEN_FILE" ]]; then
-    BROKEN_FILE=$(echo "$ERROR_LOG" | grep -oE '\.?/?[a-zA-Z0-9_-]+\.sh' | head -n1 | sed 's#^\./##')
+BROKEN_FILE=""
+BUG_DESC=""
+
+# Jenkinsfile: Docker command errors
+if grep -Eqi 'docker[[:space:]]+rum|unknown flag: --rm' \
+    <<< "$ERROR_LOG"; then
+
+    BROKEN_FILE="Jenkinsfile"
+
+    BUG_DESC="The Jenkinsfile contains an incorrect Docker command. Inspect the Docker command and correct the typo without modifying unrelated stages."
+
+# Jenkinsfile: Pipeline syntax errors
+elif grep -Eqi \
+    'WorkflowScript:|MultipleCompilationErrorsException|No such DSL method|Expected a step|Invalid.*Declarative Pipeline' \
+    <<< "$ERROR_LOG"; then
+
+    BROKEN_FILE="Jenkinsfile"
+
+    BUG_DESC="The Jenkins Declarative Pipeline contains a syntax or DSL error. Identify and correct the exact pipeline issue."
+
+# Dockerfile errors
+elif grep -Eqi \
+    'Dockerfile.*(error|failed)|failed to solve.*Dockerfile' \
+    <<< "$ERROR_LOG"; then
+
+    BROKEN_FILE="Dockerfile"
+
+    BUG_DESC="The Dockerfile contains an invalid instruction or build configuration. Fix the actual Docker build error."
+
+# Java errors
+elif grep -Eqi 'error: .*|cannot find symbol|illegal start' \
+    <<< "$ERROR_LOG" &&
+    grep -qE '\.java' <<< "$ERROR_LOG"; then
+
+    BROKEN_FILE=$(grep -oE '[a-zA-Z0-9_./-]+\.java' \
+        <<< "$ERROR_LOG" | head -n1)
+
+    BUG_DESC="The Java source contains a compilation error. Fix the specific reported issue."
+
+# Shell script errors
+elif grep -Eqi \
+    'command not found|syntax error near unexpected token' \
+    <<< "$ERROR_LOG"; then
+
+    SHELL_FILE=$(grep -oE '(/[a-zA-Z0-9_./-]+|[a-zA-Z0-9_./-]+)\.sh' \
+        <<< "$ERROR_LOG" | head -n1 || true)
+
+    if [[ -n "$SHELL_FILE" ]]; then
+        BROKEN_FILE="${SHELL_FILE##*/}"
+    fi
+
+    BUG_DESC="The shell script contains an invalid command or syntax. Fix the actual error."
+
+# Node.js errors
+elif grep -Eqi \
+    'npm ERR!|npm error|SyntaxError|Module not found|Cannot find module' \
+    <<< "$ERROR_LOG"; then
+
+    JS_FILE=$(grep -oE \
+        '(src|backend|frontend)/[a-zA-Z0-9_./-]+\.(js|jsx|ts|tsx)' \
+        <<< "$ERROR_LOG" | head -n1 || true)
+
+    if [[ -n "$JS_FILE" ]]; then
+        BROKEN_FILE="$JS_FILE"
+    elif grep -Eqi 'package-lock|npm ci|lock file' <<< "$ERROR_LOG"; then
+        BROKEN_FILE="package-lock.json"
+    else
+        BROKEN_FILE="package.json"
+    fi
+
+    BUG_DESC="The Node.js project has a dependency or source-code error. Analyze the npm output and fix the relevant issue."
+
 fi
 
-if [[ -z "$BROKEN_FILE" || ! -f "$BROKEN_FILE" ]]; then
-    echo "⚠️ Could not identify a specific broken file from the log. Trying build.sh as default."
-    BROKEN_FILE="build.sh"
-fi
+# ----------------------------------------------------------
+# 4. VERIFY TARGET FILE
+# ----------------------------------------------------------
 
-if [[ ! -f "$BROKEN_FILE" ]]; then
-    echo "❌ '${BROKEN_FILE}' does not exist in the repo. Cannot proceed with a fix."
+if [[ -z "$BROKEN_FILE" ]]; then
+
+    log "Could not identify the broken file."
+    log "No automatic file modification will be attempted."
+
     exit 0
 fi
 
-echo "🔎 Identified broken file: ${BROKEN_FILE}"
+log "Identified broken file: $BROKEN_FILE"
+
+case "$BROKEN_FILE" in
+    Jenkinsfile|Dockerfile|*.sh|*.java|*.js|*.jsx|*.ts|*.tsx|package.json|package-lock.json)
+        ;;
+    *)
+        log "Unsupported file type. Skipping."
+        exit 0
+        ;;
+esac
+
+if [[ ! -f "$BROKEN_FILE" ]]; then
+    log "Target file does not exist: $BROKEN_FILE"
+    exit 0
+fi
+
+if ! git ls-files --error-unmatch "$BROKEN_FILE" >/dev/null 2>&1; then
+    log "Target file is not tracked by Git."
+    exit 0
+fi
+
+if [[ -z "$BUG_DESC" ]]; then
+    BUG_DESC="Analyze the actual Jenkins failure and fix the root cause in the target file."
+fi
+
 CURRENT_CONTENT=$(cat "$BROKEN_FILE")
 
-# ── 2. Extract a pointed description of the bug, by error category ─────
-BUG_DESC=""
+# ----------------------------------------------------------
+# 5. CREATE AI PROMPT
+# ----------------------------------------------------------
 
-BROKEN_CMD=$(echo "$ERROR_LOG" | grep -oE '[a-zA-Z0-9_.-]+: command not found' | head -n1 | sed 's/: command not found//')
-if [[ -n "$BROKEN_CMD" ]]; then
-    BUG_DESC="The command '${BROKEN_CMD}' does not exist. It is a typo of a real command. Figure out the closest real command name and fix the typo."
-fi
+log "Preparing AI repair prompt..."
 
-if [[ -z "$BUG_DESC" ]]; then
-    BROKEN_FLAG=$(echo "$ERROR_LOG" | grep -oiE "(invalid flag|unrecognized option): *[-a-zA-Z]+" | head -n1)
-    if [[ -n "$BROKEN_FLAG" ]]; then
-        BUG_DESC="There is a bad command-line flag: '${BROKEN_FLAG}'. It is a typo of a real, valid flag for that command. Fix the typo."
-    fi
-fi
-
-if [[ -z "$BUG_DESC" ]]; then
-    MISSING_PATH=$(echo "$ERROR_LOG" | grep -oE "[a-zA-Z0-9_./-]+: No such file or directory" | head -n1 | sed 's/: No such file or directory//')
-    if [[ -n "$MISSING_PATH" ]]; then
-        BUG_DESC="The path '${MISSING_PATH}' does not exist. It is likely a typo'd file/folder name used somewhere in this script. Fix the typo so it points to a path that is actually created or used correctly elsewhere in the script."
-    fi
-fi
-
-if [[ -z "$BUG_DESC" ]]; then
-    PERM_FILE=$(echo "$ERROR_LOG" | grep -oE "[a-zA-Z0-9_./-]+: Permission denied" | head -n1 | sed 's/: Permission denied//')
-    if [[ -n "$PERM_FILE" ]]; then
-        BUG_DESC="The file '${PERM_FILE}' is not executable. Add a line before it runs to make it executable (chmod +x), or fix how it's invoked (e.g. call it as 'bash ${PERM_FILE}' instead of './${PERM_FILE}')."
-    fi
-fi
-
-if [[ -z "$BUG_DESC" ]]; then
-    JAVA_ERR_LINE=$(echo "$ERROR_LOG" | grep -oE "[a-zA-Z0-9_./-]+\.java:[0-9]+: error: .+" | head -n1)
-    if [[ -n "$JAVA_ERR_LINE" ]]; then
-        BUG_DESC="There is a Java syntax error: ${JAVA_ERR_LINE}. Fix this specific syntax error."
-    fi
-fi
-
-if [[ -z "$BUG_DESC" ]]; then
-    LAST_LINE=$(echo "$ERROR_LOG" | grep -v '^\s*$' | tail -n1)
-    BUG_DESC="The script failed with this error: ${LAST_LINE}. Diagnose the specific line causing it and fix it."
-fi
-
-echo "🐞 Bug description sent to LLM: ${BUG_DESC}"
-
-# ── 3. Build the prompt ─────────────────────────────────────────────────
 PROMPT=$(cat <<EOF
-Fix the bug in this script.
+You are an expert DevOps engineer and CI/CD self-healing agent.
 
---- SCRIPT (${BROKEN_FILE}) ---
-${CURRENT_CONTENT}
+Your job is to repair the actual Jenkins build failure.
 
---- BUG ---
-${BUG_DESC}
+TARGET FILE:
+$BROKEN_FILE
 
---- TASK ---
-Output the complete corrected script with the bug fixed. Output ONLY raw
-script content — no explanations, no markdown fences, no commentary before
-or after the code. Your entire response must be valid, directly-runnable
-script content starting with the first line (e.g. the shebang) and nothing
-else.
+BUG DESCRIPTION:
+$BUG_DESC
+
+ACTUAL JENKINS ERROR:
+$ERROR_LOG
+
+CURRENT FILE CONTENT:
+================ START ================
+$CURRENT_CONTENT
+================ END ==================
+
+REQUIREMENTS:
+
+1. Identify the exact root cause.
+2. Correct the actual error.
+3. Preserve all existing functionality.
+4. Do not remove existing pipeline stages.
+5. Preserve all credentials references.
+6. Preserve environment variables and URLs.
+7. Do not introduce unrelated changes.
+8. Do not invent credentials or configuration.
+9. For Jenkinsfile, return a valid Declarative Pipeline.
+10. For shell scripts, return valid Bash code.
+11. Return the complete corrected file.
+12. If the issue cannot be safely fixed, return NO_FIX_AVAILABLE.
+
+OUTPUT FORMAT:
+
+Return ONLY the complete corrected source code.
+
+No explanations.
+No Markdown fences.
+No additional commentary.
+No partial code.
+
+The output must be directly usable as a complete replacement for $BROKEN_FILE.
 EOF
 )
 
-echo "📡 Calling local LLM (${MODEL})..."
-RESPONSE=$(curl -s "${OLLAMA_URL}" -d @<(jq -n --arg model "$MODEL" --arg prompt "$PROMPT" '{
-    model: $model,
-    prompt: $prompt,
-    stream: false
-}'))
+# ----------------------------------------------------------
+# 6. CALL OLLAMA
+# ----------------------------------------------------------
 
-FIXED_CONTENT=$(echo "$RESPONSE" | jq -r '.response')
+log "Sending failure analysis to Ollama..."
+log "Model: $MODEL"
 
-echo "=== DEBUG: Raw LLM response ==="
-echo "$FIXED_CONTENT"
-echo "=== END DEBUG ==="
+PAYLOAD=$(jq -n \
+    --arg model "$MODEL" \
+    --arg prompt "$PROMPT" \
+    '{
+        model: $model,
+        prompt: $prompt,
+        stream: false,
+        options: {
+            temperature: 0.1,
+            num_ctx: 8192
+        }
+    }')
 
-if [[ -z "$FIXED_CONTENT" || "$FIXED_CONTENT" == "null" || "$FIXED_CONTENT" == *"NO_FIX_AVAILABLE"* ]]; then
-    echo "⚠️ No fix could be generated. Exiting cleanly."
+RESPONSE=$(curl \
+    --fail \
+    --silent \
+    --show-error \
+    --connect-timeout 15 \
+    --max-time 900 \
+    -H "Content-Type: application/json" \
+    -d "$PAYLOAD" \
+    "$OLLAMA_URL")
+
+FIXED_CONTENT=$(jq -r '.response // empty' <<< "$RESPONSE")
+
+if [[ -z "$FIXED_CONTENT" ]]; then
+    log "ERROR: Empty AI response."
+    exit 1
+fi
+
+if grep -q 'NO_FIX_AVAILABLE' <<< "$FIXED_CONTENT"; then
+    log "AI could not generate a safe fix."
     exit 0
 fi
 
-# Extract only what's between the first pair of code fences, if the model
-# used them. If no fences are found, fall back to the raw response —
-# the syntax validation gate below is what actually protects us in that case.
-CLEANED_CONTENT=$(echo "$FIXED_CONTENT" | awk '
-    /^```/ { fence++; next }
-    fence == 1 { print }
-')
-if [[ -z "$CLEANED_CONTENT" ]]; then
-    CLEANED_CONTENT="$FIXED_CONTENT"
-fi
-FIXED_CONTENT="$CLEANED_CONTENT"
+log "AI response received."
 
-if [[ $(echo "$FIXED_CONTENT" | wc -l) -lt 2 ]]; then
-    echo "⚠️ Generated fix looks too short/invalid. Skipping to avoid corrupting the file."
-    exit 0
-fi
+# ----------------------------------------------------------
+# 7. CLEAN AI RESPONSE
+# ----------------------------------------------------------
 
-# ── Syntax validation gate ──────────────────────────────────────────────
-# Regardless of how the model formatted its response, never trust it blindly.
-# Only accept the result if it's actually valid, parseable script syntax.
-# This is what actually protects against prose/commentary getting written
-# into the file, not the fence-stripping above (which only helps when the
-# model behaves and uses fences in the first place).
-if [[ "$BROKEN_FILE" == *.sh ]]; then
-    if ! bash -n <(echo "$FIXED_CONTENT") 2>/dev/null; then
-        echo "⚠️ Generated fix is not valid bash syntax. Rejecting to avoid corrupting the file."
-        echo "--- Rejected content (for reference) ---"
-        echo "$FIXED_CONTENT"
-        exit 0
+if grep -q '^```' <<< "$FIXED_CONTENT"; then
+
+    CLEANED_CONTENT=$(printf '%s\n' "$FIXED_CONTENT" | awk '
+        /^```/ {
+            if (!inside) {
+                inside=1
+                next
+            }
+            exit
+        }
+        inside {
+            print
+        }
+    ')
+
+    if [[ -n "$CLEANED_CONTENT" ]]; then
+        FIXED_CONTENT="$CLEANED_CONTENT"
     fi
-    echo "✅ Syntax check passed: generated fix is valid bash."
 fi
-# (No equivalent lightweight syntax-only check is wired up for .java files
-#  yet — javac requires a classpath/context to check properly. Treat any
-#  .java auto-fix PR with extra scrutiny for now.)
 
-# ── 4. Apply the fix: overwrite the file, commit, push, open PR ────────
-git checkout -b "${BRANCH}"
-echo "$FIXED_CONTENT" > "$BROKEN_FILE"
+# ----------------------------------------------------------
+# 8. SAVE GENERATED CONTENT
+# ----------------------------------------------------------
 
-echo "📄 New content written to ${BROKEN_FILE}:"
-cat "$BROKEN_FILE"
+TEMP_FILE=$(mktemp)
+
+printf '%s\n' "$FIXED_CONTENT" > "$TEMP_FILE"
+
+if [[ $(wc -l < "$TEMP_FILE") -lt 2 ]]; then
+    log "Generated content is too short. Rejecting."
+    exit 0
+fi
+
+if grep -Eqi \
+    '^(Here is|Here are|Explanation:|The corrected|```)' \
+    "$TEMP_FILE"; then
+
+    log "AI returned explanatory text. Rejecting."
+    exit 0
+fi
+
+# ----------------------------------------------------------
+# 9. VALIDATE GENERATED CODE
+# ----------------------------------------------------------
+
+log "Validating generated code..."
+
+case "$BROKEN_FILE" in
+
+    *.sh)
+
+        if ! bash -n "$TEMP_FILE"; then
+            log "Invalid Bash syntax. Rejecting fix."
+            exit 0
+        fi
+
+        log "Bash syntax validation passed."
+        ;;
+
+    Jenkinsfile)
+
+        if ! grep -Eq '^[[:space:]]*pipeline[[:space:]]*\{' "$TEMP_FILE"; then
+            log "Invalid Jenkinsfile: pipeline block missing."
+            exit 0
+        fi
+
+        if ! grep -Eq '^[[:space:]]*stages[[:space:]]*\{' "$TEMP_FILE"; then
+            log "Invalid Jenkinsfile: stages block missing."
+            exit 0
+        fi
+
+        if ! grep -Eq '^[[:space:]]*post[[:space:]]*\{' "$TEMP_FILE"; then
+            log "WARNING: Jenkinsfile post block is missing."
+            exit 0
+        fi
+
+        log "Basic Jenkinsfile validation passed."
+        ;;
+
+    *.json)
+
+        if ! jq empty "$TEMP_FILE"; then
+            log "Invalid JSON. Rejecting fix."
+            exit 0
+        fi
+
+        log "JSON validation passed."
+        ;;
+
+    Dockerfile)
+
+        if ! grep -Eq '^[[:space:]]*FROM[[:space:]]+' "$TEMP_FILE"; then
+            log "Dockerfile FROM instruction missing."
+            exit 0
+        fi
+
+        log "Basic Dockerfile validation passed."
+        ;;
+
+    *.js|*.jsx|*.ts|*.tsx)
+
+        log "Source validation will be performed by the next application build."
+        ;;
+
+    *.java)
+
+        log "Java validation will be performed by the next compilation."
+        ;;
+
+    package.json|package-lock.json)
+
+        log "Package configuration validation passed."
+        ;;
+
+esac
+
+# ----------------------------------------------------------
+# 10. VERIFY GITHUB REPOSITORY
+# ----------------------------------------------------------
+
+REPOSITORY=$(gh repo view \
+    --json nameWithOwner \
+    --jq '.nameWithOwner')
+
+if [[ -z "$REPOSITORY" ]]; then
+    log "Could not identify GitHub repository."
+    exit 1
+fi
+
+log "GitHub repository: $REPOSITORY"
+
+# ----------------------------------------------------------
+# 11. CREATE FIX BRANCH
+# ----------------------------------------------------------
+
+log "Creating AI fix branch..."
 
 git config user.email "self-heal-bot@local"
 git config user.name "Self Heal Bot"
-git add "$BROKEN_FILE"
-git commit -m "🤖 Auto-fix attempt for build #${BUILD_NUMBER} (${BROKEN_FILE})"
 
-ORIGIN_URL=$(git config --get remote.origin.url)
-CLEAN_URL=$(echo "$ORIGIN_URL" | sed -E 's#(https://)?(git@)?github.com[:/]#github.com/#' | sed 's#\.git$##')
-PUSH_URL="https://x-access-token:${GITHUB_TOKEN}@${CLEAN_URL}.git"
+git switch -c "$BRANCH"
 
-git push "$PUSH_URL" "${BRANCH}"
+# ----------------------------------------------------------
+# 12. APPLY FIX
+# ----------------------------------------------------------
+
+cp "$TEMP_FILE" "$BROKEN_FILE"
+
+if ! git diff --check; then
+
+    log "Git whitespace validation failed."
+
+    git restore -- "$BROKEN_FILE"
+
+    exit 0
+fi
+
+if git diff --quiet -- "$BROKEN_FILE"; then
+    log "AI did not generate any changes."
+    exit 0
+fi
+
+log "AI changes applied."
+
+echo
+echo "========== PROPOSED CHANGES =========="
+
+git diff -- "$BROKEN_FILE"
+
+echo "======================================"
+
+# ----------------------------------------------------------
+# 13. COMMIT FIX
+# ----------------------------------------------------------
+
+git add -- "$BROKEN_FILE"
+
+git commit \
+    -m "AI Auto-Fix: Build #${BUILD_NUMBER} - ${BROKEN_FILE}"
+
+log "AI fix committed."
+
+# ----------------------------------------------------------
+# 14. PUSH FIX BRANCH
+# ----------------------------------------------------------
+
+export GH_TOKEN="$GITHUB_TOKEN"
+
+gh auth setup-git
+
+log "Pushing fix branch to GitHub..."
+
+git push origin "$BRANCH"
+
+# ----------------------------------------------------------
+# 15. CREATE PULL REQUEST
+# ----------------------------------------------------------
+
+log "Creating GitHub Pull Request..."
+
+PR_BODY=$(cat <<EOF
+## AI Self-Healing Pull Request
+
+**Build Number:** #${BUILD_NUMBER}
+
+**AI Model:** ${MODEL}
+
+**Target File:** ${BROKEN_FILE}
+
+**Base Branch:** ${GIT_BRANCH}
+
+### Detected Issue
+
+${BUG_DESC}
+
+### Jenkins Error
+
+\`\`\`
+${ERROR_LOG}
+\`\`\`
+
+### Changes
+
+- Analyzed Jenkins failure.
+- Generated a proposed correction using local Ollama.
+- Applied basic source validation.
+- Isolated the change to the identified file.
+
+### Review
+
+This change was generated automatically.
+
+Please review the proposed correction and run a new Jenkins build before merging.
+EOF
+)
 
 gh pr create \
-  --title "🤖 Auto-fix: build #${BUILD_NUMBER} failure (${BROKEN_FILE})" \
-  --body "Automated fix proposed by local self-healing pipeline for build #${BUILD_NUMBER}. Model: ${MODEL}. File changed: ${BROKEN_FILE}. Bug detected: ${BUG_DESC} Please review carefully — this was generated automatically and may be wrong." \
-  --base main \
-  --head "${BRANCH}"
+    --repo "$REPOSITORY" \
+    --base "$GIT_BRANCH" \
+    --head "$BRANCH" \
+    --title "AI Auto-Fix: Build #${BUILD_NUMBER} - ${BROKEN_FILE}" \
+    --body "$PR_BODY"
 
-echo "✅ PR created for branch ${BRANCH}."
+# ----------------------------------------------------------
+# 16. COMPLETED
+# ----------------------------------------------------------
+
+log "=================================================="
+log "          SELF-HEALING COMPLETED"
+log "=================================================="
+
+log "Repository : $REPOSITORY"
+log "Target     : $BROKEN_FILE"
+log "Branch     : $BRANCH"
+log "Base       : $GIT_BRANCH"
+log "AI Model   : $MODEL"
+
+log "Pull Request created successfully."
