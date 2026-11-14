@@ -13,18 +13,16 @@ pipeline {
 
     environment {
         // GitHub
-        GIT_URL       = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
-        GIT_BRANCH    = 'master'
+        GIT_URL      = 'https://github.com/cloudvivek/DevOps-Project-Zomato-Kastro.git'
+        GIT_BRANCH   = 'master'
 
         // Docker Hub
-        DOCKER_IMAGE  = 'teqvivek123/zomato-kastro'
+        DOCKER_IMAGE = 'teqvivek123/zomato-kastro'
     }
 
     stages {
 
-        // --------------------------------------------------
         // 1. CHECKOUT
-        // --------------------------------------------------
         stage('Checkout') {
             steps {
                 deleteDir()
@@ -44,9 +42,7 @@ pipeline {
             }
         }
 
-        // --------------------------------------------------
         // 2. NODE.JS INSTALL & BUILD
-        // --------------------------------------------------
         stage('Node.js Install and Build') {
             steps {
                 sh '''
@@ -84,9 +80,7 @@ pipeline {
             }
         }
 
-        // --------------------------------------------------
         // 3. BUILD DOCKER IMAGE
-        // --------------------------------------------------
         stage('Build Docker Image') {
             steps {
                 sh '''
@@ -96,7 +90,7 @@ pipeline {
 
                     test -f Dockerfile
 
-                    docker buil \
+                    docker build \
                         --pull \
                         -t "$DOCKER_IMAGE:$BUILD_NUMBER" \
                         -t "$DOCKER_IMAGE:latest" \
@@ -110,14 +104,16 @@ pipeline {
         }
     }
 
+    // SELF-HEALING POST ACTIONS
     post {
-        success {
-            echo 'Pipeline completed successfully.'
-            echo 'GitHub → Node.js Build → Docker Build → Docker Hub Push'
+        failure {
+            echo '🤖 Pipeline failed — invoking self-healing stage...'
+
+            sh 'bash ./self_heal.sh || echo "Self-heal script encountered an issue, see logs above."'
         }
 
-        failure {
-            echo 'Pipeline failed. Review Console Output.'
+        always {
+            echo '🧹 Pipeline execution completed.'
         }
     }
 }
